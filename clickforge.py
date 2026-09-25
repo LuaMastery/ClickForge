@@ -26,7 +26,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 # owner/repo do GitHub usado pelo verificador de atualizações (releases).
 UPDATE_REPO = "LuaMastery/ClickForge"
 
