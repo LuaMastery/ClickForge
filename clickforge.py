@@ -604,6 +604,14 @@ class AutoClickerApp:
         self._refresh_profile_list()
         self._refresh_marker()
 
+        # Salva sozinho qualquer alteração feita depois de aberto — não só
+        # ao fechar pela bandeja. "_autosave_job" guarda o agendamento
+        # pendente para não gravar o arquivo a cada tecla digitada: várias
+        # mudanças seguidas (ex: digitando um número) viram um único save,
+        # feito pouco depois de parar de mexer.
+        self._autosave_job = None
+        self._register_autosave_traces()
+
         try:
             self._app_icon_image = ImageTk.PhotoImage(_build_tray_image())
             self.root.iconphoto(True, self._app_icon_image)
@@ -1029,6 +1037,7 @@ class AutoClickerApp:
         c.stop_now_event.set()
         c.run_event.set()
         self._refresh_clicker_list()
+        self._schedule_autosave()
 
     def _open_clicker_editor(self, clicker):
         win = tk.Toplevel(self.root)
@@ -1208,6 +1217,7 @@ class AutoClickerApp:
             clicker.hotkey_enabled = var_enabled.get()
 
             self._refresh_clicker_list()
+            self._schedule_autosave()
             self._capture_callback = None
             win.destroy()
 
@@ -1309,11 +1319,13 @@ class AutoClickerApp:
             self.listening_for_hotkey = False
             self.hotkey = trigger
             self.root.after(0, lambda: self.lbl_hotkey.config(text=f"Tecla atual: {trigger_to_label(trigger)}"))
+            self.root.after(0, self._schedule_autosave)
             return True
         if self.listening_for_stopkey:
             self.listening_for_stopkey = False
             self.stop_key = trigger
             self.root.after(0, lambda: self.lbl_stop_key.config(text=f"Tecla atual: {trigger_to_label(trigger)}"))
+            self.root.after(0, self._schedule_autosave)
             return True
         if self.listening_for_action_key:
             if trigger[0] != "keyboard":
@@ -1324,6 +1336,7 @@ class AutoClickerApp:
             self.listening_for_action_key = False
             self.action_key = trigger[1]
             self.root.after(0, lambda: self.lbl_action_key.config(text=f"Tecla: {key_to_label(trigger[1])}"))
+            self.root.after(0, self._schedule_autosave)
             return True
         if self._capture_callback is not None:
             callback = self._capture_callback
@@ -1489,6 +1502,7 @@ class AutoClickerApp:
             self.var_position_mode.set("Posição fixa")
             self.capturing_pos = False
             self._refresh_marker()
+            self._schedule_autosave()
             return
         self.lbl_fixed_pos.config(text=f"capturando em {seconds_left}...")
         self.root.after(1000, lambda: self._countdown_capture(seconds_left - 1))
@@ -1874,6 +1888,7 @@ class AutoClickerApp:
     def _hide_to_tray(self):
         """Chamado ao clicar no X da janela: esconde em vez de fechar, para
         o autoclique, os atalhos e a bandeja continuarem funcionando."""
+        self._save_config()
         self.root.withdraw()
         if not self._notified_background:
             self._notified_background = True
@@ -1904,6 +1919,9 @@ class AutoClickerApp:
 
     def _quit_app(self):
         """Fecha o app de verdade (só acessível pelo menu da bandeja)."""
+        if self._autosave_job is not None:
+            self.root.after_cancel(self._autosave_job)
+            self._autosave_job = None
         if self._pending_update_path and os.path.isfile(self._pending_update_path):
             self._apply_pending_update()
         self._save_config()
@@ -2076,6 +2094,24 @@ class AutoClickerApp:
                 json.dump(self._gather_config_dict(), f)
         except OSError:
             pass
+
+    def _register_autosave_traces(self):
+        """Liga um "trace" em toda variável do Tkinter (checkboxes, combos,
+        campos de texto de todas as abas): qualquer mudança agenda um save.
+        Isso cobre automaticamente configurações novas que forem adicionadas
+        no futuro, sem precisar lembrar de conectar cada widget na mão."""
+        for value in vars(self).values():
+            if isinstance(value, tk.Variable):
+                value.trace_add("write", self._schedule_autosave)
+
+    def _schedule_autosave(self, *_args):
+        if self._autosave_job is not None:
+            self.root.after_cancel(self._autosave_job)
+        self._autosave_job = self.root.after(1200, self._run_autosave)
+
+    def _run_autosave(self):
+        self._autosave_job = None
+        self._save_config()
 
     # ---------- Perfis ----------
 
