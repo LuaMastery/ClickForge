@@ -1,0 +1,36 @@
+name: Build and release
+
+# Roda quando uma tag "vX.Y.Z" é enviada ao repositório — ou seja, só depois
+# que a versão nova já foi testada e aprovada. Compila o .exe no Windows e
+# publica automaticamente como uma GitHub Release, com o arquivo anexado.
+# É esse anexo que o verificador de atualização do próprio app usa.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Compilar ClickForge.exe
+        run: python -m PyInstaller --onefile --windowed --name ClickForge --icon icon.ico clickforge.py
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" dist/ClickForge.exe --title "ClickForge ${{ github.ref_name }}" --generate-notes
