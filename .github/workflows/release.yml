@@ -4,6 +4,11 @@ name: Build and release
 # que a versão nova já foi testada e aprovada. Compila o .exe no Windows e
 # publica automaticamente como uma GitHub Release, com o arquivo anexado.
 # É esse anexo que o verificador de atualização do próprio app usa.
+#
+# O .exe é compilado aqui, dentro do GitHub, a partir do código público da tag
+# — não é enviado do computador de ninguém. Junto dele sai o hash SHA-256
+# (conferido pelo próprio app antes de atualizar) e uma atestação de
+# procedência assinada pelo GitHub, que prova qual commit gerou o arquivo.
 on:
   push:
     tags:
@@ -11,6 +16,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build-and-release:
@@ -27,10 +34,24 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
+      - name: Gerar metadados do executável
+        run: python make_version_info.py
+
       - name: Compilar ClickForge.exe
-        run: python -m PyInstaller --onefile --windowed --name ClickForge --icon icon.ico clickforge.py
+        run: python -m PyInstaller --onefile --windowed --noupx --name ClickForge --icon icon.ico --version-file version_info.txt clickforge.py
+
+      - name: Gerar SHA-256
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist/ClickForge.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  ClickForge.exe" | Out-File -Encoding ascii dist/ClickForge.exe.sha256
+
+      - name: Atestar procedência do build
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/ClickForge.exe
 
       - name: Publicar release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release create "${{ github.ref_name }}" dist/ClickForge.exe --title "ClickForge ${{ github.ref_name }}" --generate-notes
+        run: gh release create "${{ github.ref_name }}" dist/ClickForge.exe dist/ClickForge.exe.sha256 --title "ClickForge ${{ github.ref_name }}" --generate-notes

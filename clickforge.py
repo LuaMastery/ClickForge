@@ -2,6 +2,7 @@
 
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import math
 import os
@@ -26,7 +27,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 # owner/repo do GitHub usado pelo verificador de atualizações (releases).
 UPDATE_REPO = "LuaMastery/ClickForge"
 
@@ -2577,16 +2578,27 @@ class AutoClickerApp:
             )
             if asset is None:
                 return
+            # A release precisa trazer o arquivo <nome>.exe.sha256 ao lado do
+            # .exe; sem ele (ou se o hash não bater) a atualização é descartada.
+            sha_asset = next(
+                (a for a in release.get("assets", []) if a.get("name", "") == asset["name"] + ".sha256"), None
+            )
+            if sha_asset is None:
+                return
+            headers = {"User-Agent": f"{APP_NAME}-updater"}
+            with urllib.request.urlopen(
+                urllib.request.Request(sha_asset["browser_download_url"], headers=headers), timeout=20
+            ) as resp:
+                expected_hash = resp.read().decode("utf-8", "replace").split()[0].strip().lower()
             exe_path = sys.executable
             new_path = exe_path + ".update"
-            req = urllib.request.Request(
-                asset["browser_download_url"], headers={"User-Agent": f"{APP_NAME}-updater"}
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp, open(new_path, "wb") as f:
-                f.write(resp.read())
-            if os.path.getsize(new_path) < 1024:
-                os.remove(new_path)
+            req = urllib.request.Request(asset["browser_download_url"], headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = resp.read()
+            if len(data) < 1024 or hashlib.sha256(data).hexdigest() != expected_hash:
                 return
+            with open(new_path, "wb") as f:
+                f.write(data)
             self._pending_update_path = new_path
             tag = release.get("tag_name", "?")
             try:

@@ -24,6 +24,10 @@ Um autoclicker leve para Windows, feito em Python/Tkinter — configurável, com
 
 Baixe o `.exe` mais recente em [Releases](../../releases) e execute — não precisa instalar nada.
 
+## Segurança e antivírus
+
+O Windows Defender pode alertar sobre o `.exe` (falso positivo comum em programas PyInstaller com atalhos globais). Não há telemetria: o app só acessa o GitHub para atualizações, e a atualização é conferida por SHA-256. Veja [SECURITY.md](SECURITY.md) para o que o programa faz, como verificar o arquivo e como reportar o falso positivo à Microsoft, e [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) para as licenças das bibliotecas usadas.
+
 ## Rodando a partir do código-fonte
 
 Requer Python 3.10+ no Windows.
@@ -37,7 +41,8 @@ python clickforge.py
 
 ```bash
 pip install pyinstaller
-python -m PyInstaller --onefile --windowed --name ClickForge --icon icon.ico clickforge.py
+python make_version_info.py
+python -m PyInstaller --onefile --windowed --noupx --name ClickForge --icon icon.ico --version-file version_info.txt clickforge.py
 ```
 
 O executável fica em `dist/ClickForge.exe`.
@@ -48,4 +53,4 @@ Pull requests são bem-vindos. O projeto é um único arquivo (`clickforge.py`) 
 
 ## Licença
 
-[MIT](LICENSE) — use, modifique e redistribua livremente.
+[MIT](LICENSE) — use, modifique e redistribua livremente. Bibliotecas de terceiros: [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).

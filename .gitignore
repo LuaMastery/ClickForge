@@ -3,4 +3,5 @@ __pycache__/
 build/
 dist/
 *.spec
+version_info.txt
 icon_preview.png
