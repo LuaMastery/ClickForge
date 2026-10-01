@@ -14,7 +14,7 @@ import time
 import tkinter as tk
 import urllib.request
 import winreg
-from tkinter import ttk, messagebox, colorchooser
+from tkinter import ttk, messagebox, colorchooser, filedialog, simpledialog
 
 from pynput import keyboard, mouse
 from PIL import Image, ImageDraw, ImageTk
@@ -26,7 +26,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 # owner/repo do GitHub usado pelo verificador de atualizações (releases).
 UPDATE_REPO = "LuaMastery/ClickForge"
 
@@ -40,6 +40,8 @@ BUTTON_MAP = {
     "Mouse 4 (Voltar)": mouse.Button.x1,
     "Mouse 5 (Avançar)": mouse.Button.x2,
 }
+
+BUTTON_MAP_BY_NAME = {v.name: v for v in BUTTON_MAP.values()}
 
 CLICK_TYPE_OPTIONS = ["Simples", "Duplo", "Triplo"]
 CLICK_TYPE_COUNT = {"Simples": 1, "Duplo": 2, "Triplo": 3}
@@ -304,6 +306,65 @@ def _send_key(vk, scan, down):
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
 
 
+# ---------------------------------------------------------------------------
+# Auxiliares de baixo nível usados pelas novas funcionalidades de automação
+# (gatilho por cor, agendamento por inatividade, perfil por janela ativa).
+class _LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
+def _get_idle_seconds():
+    """Há quantos segundos o usuário não mexe no mouse/teclado (em todo o
+    sistema, não só neste app) — usado pelo agendamento por inatividade."""
+    lii = _LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(_LASTINPUTINFO)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(lii)):
+        return 0.0
+    millis = ctypes.windll.kernel32.GetTickCount() - lii.dwTime
+    return max(0.0, millis / 1000.0)
+
+
+def _get_pixel_color(x, y):
+    """Lê a cor (r, g, b) de um pixel da tela — usado pelo gatilho por cor."""
+    hdc = ctypes.windll.user32.GetDC(None)
+    if not hdc:
+        return None
+    try:
+        colorref = ctypes.windll.gdi32.GetPixel(hdc, int(x), int(y))
+    finally:
+        ctypes.windll.user32.ReleaseDC(None, hdc)
+    if colorref == -1:
+        return None
+    return (colorref & 0xFF, (colorref >> 8) & 0xFF, (colorref >> 16) & 0xFF)
+
+
+def _get_foreground_window_info():
+    """Retorna (título, nome do processo) da janela em primeiro plano —
+    usado pela troca automática de perfil por janela ativa."""
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if not hwnd:
+        return "", ""
+    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buf, length + 1)
+    title = buf.value
+
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    process_name = ""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    hproc = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if hproc:
+        try:
+            name_buf = ctypes.create_unicode_buffer(260)
+            size = wintypes.DWORD(260)
+            if ctypes.windll.kernel32.QueryFullProcessImageNameW(hproc, 0, name_buf, ctypes.byref(size)):
+                process_name = os.path.basename(name_buf.value)
+        finally:
+            ctypes.windll.kernel32.CloseHandle(hproc)
+    return title, process_name
+
+
 def _build_tray_image():
     """Gera o ícone da bandeja na hora (cursor com anéis de clique), sem
     depender de arquivo externo — assim funciona igual dentro do .exe."""
@@ -320,10 +381,20 @@ def _build_tray_image():
     return img
 
 
+# Nome da pasta de dados: deliberadamente diferente de APP_NAME. Um usuário
+# real deste app tinha outro programa (sem relação nenhuma, um app Electron)
+# que já usava "%APPDATA%\ClickForge" como sua própria pasta — se
+# usássemos o mesmo nome, nossos arquivos ficariam misturados com os dele.
+# Um nome mais específico praticamente elimina o risco de colisão.
+_APPDATA_FOLDER_NAME = "ClickForge-Autoclicker"
+_OUR_DATA_FILES = ("config.json", "profiles.json", "stats.json")
+
+
 def _migrate_old_appdata_dir(dir_path):
     """O app se chamava "AutoClicker" antes de virar ClickForge — na primeira
     vez que roda com o nome novo, copia a pasta de dados antiga (config e
-    perfis) para não perder o que o usuário já tinha configurado."""
+    perfis) para não perder o que o usuário já tinha configurado. Essa pasta
+    antiga era exclusivamente nossa, então copiar tudo é seguro."""
     base = os.path.dirname(dir_path)
     old_dir = os.path.join(base, "AutoClicker")
     if os.path.isdir(old_dir) and not os.path.isdir(dir_path):
@@ -334,11 +405,34 @@ def _migrate_old_appdata_dir(dir_path):
             pass
 
 
+def _migrate_name_collision(dir_path):
+    """Uma versão anterior usava "%APPDATA%\\ClickForge" (igual a APP_NAME)
+    como pasta de dados — mas essa pasta pode já pertencer a outro programa
+    sem relação nenhuma com o nosso. Se houver arquivos NOSSOS lá (pelo nome
+    exato), só esses são movidos para a pasta nova — nunca a pasta toda —
+    para não mexer em nada que seja daquele outro programa."""
+    base = os.path.dirname(dir_path)
+    old_dir = os.path.join(base, "ClickForge")
+    if not os.path.isdir(old_dir) or os.path.isdir(dir_path):
+        return
+    found = [f for f in _OUR_DATA_FILES if os.path.isfile(os.path.join(old_dir, f))]
+    if not found:
+        return
+    try:
+        os.makedirs(dir_path, exist_ok=True)
+        for f in found:
+            os.replace(os.path.join(old_dir, f), os.path.join(dir_path, f))
+    except OSError:
+        pass
+
+
 def _appdata_dir():
     base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    dir_path = os.path.join(base, APP_NAME)
+    dir_path = os.path.join(base, _APPDATA_FOLDER_NAME)
     if not os.path.isdir(dir_path):
-        _migrate_old_appdata_dir(dir_path)
+        _migrate_name_collision(dir_path)
+        if not os.path.isdir(dir_path):
+            _migrate_old_appdata_dir(dir_path)
     os.makedirs(dir_path, exist_ok=True)
     return dir_path
 
@@ -534,7 +628,15 @@ class AutoClickerApp:
         self.root = root
         self.launched_via_startup = launched_via_startup
         self.root.title(APP_NAME)
-        self.root.resizable(False, False)
+        self.root.resizable(True, True)
+        self.root.minsize(700, 560)
+        self.root.geometry("860x620")
+        # Sem isso, redimensionar a janela não faz o conteúdo (notebook)
+        # acompanhar — ele fica do tamanho original "flutuando" num canto e
+        # a área extra vira espaço vazio, ou a barra de abas fica cortada se
+        # a janela ficar menor que o necessário para mostrar todas as abas.
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
 
         self.running = False
         self.click_count = 0
@@ -598,6 +700,36 @@ class AutoClickerApp:
         # Autocliques extras, gerenciados pela aba "Múltiplos" — cada um roda
         # de forma totalmente independente do clicker principal acima.
         self.clickers = []
+
+        # Sequência de posições (aba Posição): ciclo de pontos, em vez de um
+        # único ponto fixo.
+        self.sequence_positions = []
+        self._seq_index = 0
+
+        # Macro (aba Macro): grava eventos reais (mouse/teclado) com o tempo
+        # entre eles e reproduz depois.
+        self.macro_events = []
+        self.macro_recording = False
+        self._macro_start_time = 0.0
+        self.macro_playing = False
+        self.macro_stop_event = threading.Event()
+
+        # Automação (aba Automação): perfil por janela ativa, agendamento e
+        # gatilho por cor de pixel.
+        self._active_window_profile = None
+        self.window_profile_rules = []
+        self.pixel_trigger_color = None
+        self.pixel_trigger_pos = None
+        self._schedule_last_run_date = None
+        self._idle_start_armed = True
+
+        # Estatísticas (aba Estatísticas): contadores persistidos em disco.
+        self.stats = {"total": 0, "days": {}}
+        self._stats_pending = 0
+
+        # Tema e som personalizado (aba Interface).
+        self._default_ttk_theme = ttk.Style().theme_use()
+        self.custom_sound_path = None
 
         self._build_ui()
         self._load_config()
@@ -671,9 +803,12 @@ class AutoClickerApp:
     def _build_ui(self):
         main = ttk.Frame(self.root, padding=10)
         main.grid(row=0, column=0, sticky="nsew")
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(0, weight=1)
 
         notebook = ttk.Notebook(main)
         notebook.grid(row=0, column=0, sticky="nsew")
+        self.notebook = notebook
 
         tab_clique = ttk.Frame(notebook, padding=8)
         tab_intervalo = ttk.Frame(notebook, padding=8)
@@ -681,8 +816,12 @@ class AutoClickerApp:
         tab_repeticao = ttk.Frame(notebook, padding=8)
         tab_atalhos = ttk.Frame(notebook, padding=8)
         tab_multi = ttk.Frame(notebook, padding=8)
+        tab_macro = ttk.Frame(notebook, padding=8)
+        tab_automacao = ttk.Frame(notebook, padding=8)
+        tab_estatisticas = ttk.Frame(notebook, padding=8)
         tab_interface = ttk.Frame(notebook, padding=8)
         tab_perfis = ttk.Frame(notebook, padding=8)
+        tab_diagnostico = ttk.Frame(notebook, padding=8)
 
         notebook.add(tab_clique, text="Clique")
         notebook.add(tab_intervalo, text="Intervalo")
@@ -690,8 +829,12 @@ class AutoClickerApp:
         notebook.add(tab_repeticao, text="Repetição")
         notebook.add(tab_atalhos, text="Atalhos")
         notebook.add(tab_multi, text="Múltiplos")
+        notebook.add(tab_macro, text="Macro")
+        notebook.add(tab_automacao, text="Automação")
+        notebook.add(tab_estatisticas, text="Estatísticas")
         notebook.add(tab_interface, text="Interface")
         notebook.add(tab_perfis, text="Perfis")
+        notebook.add(tab_diagnostico, text="Diagnóstico")
 
         self._build_tab_clique(tab_clique)
         self._build_tab_intervalo(tab_intervalo)
@@ -699,8 +842,12 @@ class AutoClickerApp:
         self._build_tab_repeticao(tab_repeticao)
         self._build_tab_atalhos(tab_atalhos)
         self._build_tab_multi(tab_multi)
+        self._build_tab_macro(tab_macro)
+        self._build_tab_automacao(tab_automacao)
+        self._build_tab_estatisticas(tab_estatisticas)
         self._build_tab_interface(tab_interface)
         self._build_tab_perfis(tab_perfis)
+        self._build_tab_diagnostico(tab_diagnostico)
 
         # Status e controle (sempre visível, fora das abas)
         ctrl_frame = ttk.Frame(main)
@@ -831,6 +978,25 @@ class AutoClickerApp:
 
         ttk.Button(pos_frame, text="Capturar posição (3s)", command=self._start_capture_position).grid(
             row=1, column=2, padx=6, pady=4
+        )
+
+        ttk.Radiobutton(
+            pos_frame, text="Sequência de posições (revezar entre vários pontos):",
+            value="Sequência de posições", variable=self.var_position_mode, command=self._refresh_marker,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(10, 4))
+
+        seq_row = ttk.Frame(pos_frame)
+        seq_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
+        self.list_sequence = tk.Listbox(seq_row, height=4, width=26)
+        self.list_sequence.grid(row=0, column=0, rowspan=3, sticky="w")
+        ttk.Button(seq_row, text="Adicionar posição atual", command=self._add_sequence_point).grid(
+            row=0, column=1, padx=6, sticky="w"
+        )
+        ttk.Button(seq_row, text="Remover selecionada", command=self._remove_sequence_point).grid(
+            row=1, column=1, padx=6, sticky="w"
+        )
+        ttk.Button(seq_row, text="Limpar tudo", command=self._clear_sequence_points).grid(
+            row=2, column=1, padx=6, sticky="w"
         )
 
         random_frame = ttk.LabelFrame(tab, text="Variação aleatória de posição")
@@ -1232,6 +1398,432 @@ class AutoClickerApp:
 
         win.protocol("WM_DELETE_WINDOW", _on_cancel)
 
+    # ---------- Macro ----------
+
+    def _build_tab_macro(self, tab):
+        info = ttk.Label(
+            tab,
+            text=(
+                "Grava uma sequência real de cliques e teclas (com o tempo entre\n"
+                "eles) e reproduz depois — útil para tarefas que não são só\n"
+                "\"clicar sempre no mesmo lugar\"."
+            ),
+            justify="left",
+        )
+        info.grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(0, 10))
+
+        rec_frame = ttk.LabelFrame(tab, text="Gravação")
+        rec_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
+
+        self.lbl_macro_status = ttk.Label(rec_frame, text="0 eventos gravados")
+        self.lbl_macro_status.grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+
+        self.btn_macro_record = ttk.Button(rec_frame, text="● Gravar", command=self._toggle_macro_recording)
+        self.btn_macro_record.grid(row=1, column=0, padx=6, pady=4)
+        ttk.Button(rec_frame, text="Limpar gravação", command=self._clear_macro).grid(row=1, column=1, padx=6, pady=4)
+
+        play_frame = ttk.LabelFrame(tab, text="Reprodução")
+        play_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
+
+        self.var_macro_loop = tk.BooleanVar(value=False)
+        ttk.Checkbutton(play_frame, text="Repetir em loop", variable=self.var_macro_loop).grid(
+            row=0, column=0, columnspan=2, sticky="w", padx=6, pady=4
+        )
+
+        self.btn_macro_play = ttk.Button(play_frame, text="▶ Reproduzir", command=self._toggle_macro_playback)
+        self.btn_macro_play.grid(row=1, column=0, padx=6, pady=4)
+
+    def _refresh_macro_status(self):
+        n = len(self.macro_events)
+        if self.macro_recording:
+            self.lbl_macro_status.config(text=f"Gravando... {n} eventos")
+        else:
+            self.lbl_macro_status.config(text=f"{n} eventos gravados")
+
+    def _toggle_macro_recording(self):
+        if self.macro_recording:
+            self.macro_recording = False
+            self.btn_macro_record.config(text="● Gravar")
+            self._schedule_autosave()
+        else:
+            if self.macro_playing:
+                return
+            self.macro_events = []
+            self.macro_recording = True
+            self._macro_start_time = time.time()
+            self.btn_macro_record.config(text="■ Parar gravação")
+        self._refresh_macro_status()
+
+    def _record_macro_event(self, event):
+        """Chamado (na thread principal) para cada evento REAL enquanto uma
+        gravação está em andamento."""
+        event["t"] = time.time() - self._macro_start_time
+        self.macro_events.append(event)
+        self._refresh_macro_status()
+
+    def _clear_macro(self):
+        if self.macro_recording or self.macro_playing:
+            return
+        self.macro_events = []
+        self._refresh_macro_status()
+        self._schedule_autosave()
+
+    def _toggle_macro_playback(self):
+        if self.macro_playing:
+            self.macro_stop_event.set()
+            return
+        if not self.macro_events or self.macro_recording:
+            return
+        self.macro_playing = True
+        self.macro_stop_event.clear()
+        self.btn_macro_play.config(text="■ Parar reprodução")
+        threading.Thread(target=self._macro_play_loop, daemon=True).start()
+
+    def _macro_play_loop(self):
+        events = list(self.macro_events)
+        loop = self.var_macro_loop.get()
+        try:
+            while True:
+                last_t = 0.0
+                for ev in events:
+                    wait = ev["t"] - last_t
+                    last_t = ev["t"]
+                    if wait > 0 and self.macro_stop_event.wait(wait):
+                        return
+                    if self.macro_stop_event.is_set():
+                        return
+                    if ev["type"] == "mouse":
+                        pos = ev.get("pos")
+                        if pos:
+                            self.mouse_ctrl.position = tuple(pos)
+                        _send_mouse_button(BUTTON_MAP_BY_NAME[ev["button"]], ev["pressed"])
+                    elif ev["type"] == "key":
+                        _send_key(ev["vk"], ev["scan"], ev["pressed"])
+                if not loop or self.macro_stop_event.is_set():
+                    return
+        finally:
+            self.macro_playing = False
+            self.root.after(0, lambda: self.btn_macro_play.config(text="▶ Reproduzir"))
+
+    # ---------- Automação ----------
+
+    def _build_tab_automacao(self, tab):
+        window_frame = ttk.LabelFrame(tab, text="Trocar perfil automaticamente pela janela ativa")
+        window_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
+        self.var_window_profile_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            window_frame, text="Ativar troca automática de perfil por janela",
+            variable=self.var_window_profile_enabled,
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+
+        ttk.Label(window_frame, text="Programa/título contém:").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.var_window_rule_match = tk.StringVar(value="")
+        ttk.Entry(window_frame, textvariable=self.var_window_rule_match, width=18).grid(
+            row=1, column=1, padx=4, pady=4, sticky="w"
+        )
+        ttk.Label(window_frame, text="Perfil:").grid(row=1, column=2, sticky="w", padx=6, pady=4)
+        self.var_window_rule_profile = tk.StringVar(value="")
+        self.combo_window_rule_profile = ttk.Combobox(
+            window_frame, textvariable=self.var_window_rule_profile, width=16, state="readonly", values=[],
+        )
+        self.combo_window_rule_profile.grid(row=1, column=3, padx=4, pady=4, sticky="w")
+        ttk.Button(window_frame, text="Adicionar regra", command=self._add_window_rule).grid(
+            row=1, column=4, padx=6, pady=4
+        )
+
+        self.list_window_rules = tk.Listbox(window_frame, height=4, width=50)
+        self.list_window_rules.grid(row=2, column=0, columnspan=4, sticky="ew", padx=6, pady=4)
+        ttk.Button(window_frame, text="Remover selecionada", command=self._remove_window_rule).grid(
+            row=2, column=4, padx=6, pady=4, sticky="n"
+        )
+
+        sched_frame = ttk.LabelFrame(tab, text="Agendamento")
+        sched_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
+
+        self.var_schedule_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            sched_frame, text="Iniciar automaticamente às (HH:MM):", variable=self.var_schedule_enabled,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        self.var_schedule_time = tk.StringVar(value="09:00")
+        ttk.Entry(sched_frame, textvariable=self.var_schedule_time, width=8).grid(row=0, column=1, padx=4, pady=4)
+
+        self.var_idle_start_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            sched_frame, text="Iniciar quando o PC ficar inativo por (min):", variable=self.var_idle_start_enabled,
+        ).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.var_idle_start_minutes = tk.StringVar(value="5")
+        ttk.Entry(sched_frame, textvariable=self.var_idle_start_minutes, width=8).grid(row=1, column=1, padx=4, pady=4)
+
+        pixel_frame = ttk.LabelFrame(tab, text="Gatilho por cor de pixel")
+        pixel_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
+
+        ttk.Label(
+            pixel_frame, text="Só clica quando a cor abaixo aparecer na posição capturada.",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
+
+        self.var_pixel_trigger_enabled = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            pixel_frame, text="Ativar gatilho por cor", variable=self.var_pixel_trigger_enabled,
+        ).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+
+        self.lbl_pixel_swatch = tk.Label(pixel_frame, text="  ", bg="#808080", relief="sunken", width=4)
+        self.lbl_pixel_swatch.grid(row=1, column=1, padx=6, pady=4)
+        self.lbl_pixel_info = ttk.Label(pixel_frame, text="nenhuma cor capturada")
+        self.lbl_pixel_info.grid(row=1, column=2, sticky="w", padx=6, pady=4)
+
+        ttk.Button(pixel_frame, text="Capturar cor na posição do mouse", command=self._capture_pixel_trigger).grid(
+            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4
+        )
+        ttk.Label(pixel_frame, text="Tolerância:").grid(row=2, column=2, sticky="w", padx=6, pady=4)
+        self.var_pixel_tolerance = tk.StringVar(value="20")
+        ttk.Entry(pixel_frame, textvariable=self.var_pixel_tolerance, width=6).grid(
+            row=2, column=3, padx=4, pady=4, sticky="w"
+        )
+
+        # Roda a cada 1s: agendamento, inatividade e troca de perfil por janela.
+        self.root.after(1000, self._automation_tick)
+
+    def _add_window_rule(self):
+        match = self.var_window_rule_match.get().strip()
+        profile = self.var_window_rule_profile.get().strip()
+        if not match or not profile:
+            messagebox.showerror("Erro", "Preencha o texto da janela e escolha um perfil.")
+            return
+        self.window_profile_rules.append({"match": match, "profile": profile})
+        self._refresh_window_rules()
+        self.var_window_rule_match.set("")
+        self._schedule_autosave()
+
+    def _remove_window_rule(self):
+        sel = self.list_window_rules.curselection()
+        if not sel:
+            return
+        del self.window_profile_rules[sel[0]]
+        self._refresh_window_rules()
+        self._schedule_autosave()
+
+    def _refresh_window_rules(self):
+        self.list_window_rules.delete(0, tk.END)
+        for rule in self.window_profile_rules:
+            self.list_window_rules.insert(tk.END, f'"{rule["match"]}" → {rule["profile"]}')
+        names = sorted(self._load_profiles().keys())
+        self.combo_window_rule_profile["values"] = names
+
+    def _capture_pixel_trigger(self):
+        pos = self.mouse_ctrl.position
+        color = _get_pixel_color(*pos)
+        if color is None:
+            messagebox.showerror("Erro", "Não foi possível ler a cor nessa posição.")
+            return
+        self.pixel_trigger_pos = pos
+        self.pixel_trigger_color = color
+        self._refresh_pixel_swatch()
+        self._schedule_autosave()
+
+    def _refresh_pixel_swatch(self):
+        if self.pixel_trigger_color:
+            r, g, b = self.pixel_trigger_color
+            self.lbl_pixel_swatch.config(bg=f"#{r:02x}{g:02x}{b:02x}")
+            x, y = self.pixel_trigger_pos
+            self.lbl_pixel_info.config(text=f"x={x}, y={y}  rgb({r},{g},{b})")
+        else:
+            self.lbl_pixel_swatch.config(bg="#808080")
+            self.lbl_pixel_info.config(text="nenhuma cor capturada")
+
+    def _pixel_trigger_matches(self):
+        try:
+            tolerance = max(0, int(self.var_pixel_tolerance.get() or 0))
+        except ValueError:
+            tolerance = 0
+        current = _get_pixel_color(*self.pixel_trigger_pos)
+        if current is None:
+            return False
+        return all(abs(a - b) <= tolerance for a, b in zip(current, self.pixel_trigger_color))
+
+    def _automation_tick(self):
+        try:
+            if self.var_window_profile_enabled.get() and self.window_profile_rules:
+                title, process = _get_foreground_window_info()
+                haystack = f"{title} {process}".lower()
+                matched = next(
+                    (r["profile"] for r in self.window_profile_rules if r["match"].lower() in haystack), None
+                )
+                if matched and matched != self._active_window_profile:
+                    profiles = self._load_profiles()
+                    if matched in profiles:
+                        self._active_window_profile = matched
+                        self._apply_config_dict(profiles[matched])
+
+            if self.var_schedule_enabled.get():
+                now = time.localtime()
+                today = time.strftime("%Y-%m-%d", now)
+                current_hm = time.strftime("%H:%M", now)
+                if current_hm == self.var_schedule_time.get().strip() and self._schedule_last_run_date != today:
+                    self._schedule_last_run_date = today
+                    if not self.running:
+                        self.start()
+
+            if self.var_idle_start_enabled.get():
+                try:
+                    minutes = float(self.var_idle_start_minutes.get() or 0)
+                except ValueError:
+                    minutes = 0
+                idle = _get_idle_seconds()
+                if minutes > 0 and idle >= minutes * 60:
+                    if self._idle_start_armed and not self.running:
+                        self._idle_start_armed = False
+                        self.start()
+                elif idle < 2:
+                    self._idle_start_armed = True
+        except Exception:
+            pass
+        self.root.after(1000, self._automation_tick)
+
+    # ---------- Estatísticas ----------
+
+    def _build_tab_estatisticas(self, tab):
+        summary_frame = ttk.Frame(tab)
+        summary_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
+        self.lbl_stats_total = ttk.Label(summary_frame, text="Total: 0", font=("Segoe UI", 11, "bold"))
+        self.lbl_stats_total.grid(row=0, column=0, sticky="w", padx=6)
+
+        self.lbl_stats_today = ttk.Label(summary_frame, text="Hoje: 0")
+        self.lbl_stats_today.grid(row=0, column=1, sticky="w", padx=20)
+
+        ttk.Button(summary_frame, text="Limpar estatísticas", command=self._clear_stats).grid(
+            row=0, column=2, sticky="e", padx=6
+        )
+
+        self.canvas_stats = tk.Canvas(tab, width=420, height=180, bg="white", highlightthickness=1)
+        self.canvas_stats.grid(row=1, column=0, sticky="w", padx=6, pady=10)
+
+        self._load_stats()
+        self._refresh_stats_view()
+        self.root.after(2000, self._stats_flush_tick)
+
+    def _stats_path(self):
+        return os.path.join(_appdata_dir(), "stats.json")
+
+    def _load_stats(self):
+        try:
+            with open(self._stats_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.stats = {"total": data.get("total", 0), "days": data.get("days", {})}
+        except (OSError, json.JSONDecodeError):
+            self.stats = {"total": 0, "days": {}}
+
+    def _save_stats(self):
+        try:
+            with open(self._stats_path(), "w", encoding="utf-8") as f:
+                json.dump(self.stats, f)
+        except OSError:
+            pass
+
+    def _register_clicks(self, count=1):
+        """Chamado a cada clique real gerado (main clicker e clickers
+        extras) para alimentar a aba Estatísticas."""
+        self._stats_pending += count
+
+    def _stats_flush_tick(self):
+        if self._stats_pending:
+            today = time.strftime("%Y-%m-%d")
+            self.stats["total"] += self._stats_pending
+            self.stats["days"][today] = self.stats["days"].get(today, 0) + self._stats_pending
+            self._stats_pending = 0
+            self._save_stats()
+            self._refresh_stats_view()
+        self.root.after(2000, self._stats_flush_tick)
+
+    def _clear_stats(self):
+        if not messagebox.askyesno("Estatísticas", "Apagar todo o histórico de estatísticas?"):
+            return
+        self.stats = {"total": 0, "days": {}}
+        self._stats_pending = 0
+        self._save_stats()
+        self._refresh_stats_view()
+
+    def _refresh_stats_view(self):
+        today = time.strftime("%Y-%m-%d")
+        self.lbl_stats_total.config(text=f"Total: {self.stats.get('total', 0)}")
+        self.lbl_stats_today.config(text=f"Hoje: {self.stats.get('days', {}).get(today, 0)}")
+
+        canvas = self.canvas_stats
+        canvas.delete("all")
+        days = []
+        for i in range(6, -1, -1):
+            t = time.time() - i * 86400
+            d = time.strftime("%Y-%m-%d", time.localtime(t))
+            label = time.strftime("%d/%m", time.localtime(t))
+            days.append((label, self.stats.get("days", {}).get(d, 0)))
+
+        max_val = max((v for _, v in days), default=0) or 1
+        w, h = 420, 180
+        bar_w = w // len(days)
+        for i, (label, val) in enumerate(days):
+            bar_h = int((val / max_val) * (h - 30))
+            x0 = i * bar_w + 10
+            x1 = x0 + bar_w - 20
+            y1 = h - 20
+            y0 = y1 - bar_h
+            canvas.create_rectangle(x0, y0, x1, y1, fill="#2563eb", outline="")
+            canvas.create_text((x0 + x1) / 2, y1 + 10, text=label, font=("Segoe UI", 7))
+            if val:
+                canvas.create_text((x0 + x1) / 2, y0 - 8, text=str(val), font=("Segoe UI", 7))
+
+    # ---------- Diagnóstico ----------
+
+    def _build_tab_diagnostico(self, tab):
+        info_frame = ttk.LabelFrame(tab, text="Status")
+        info_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
+
+        self.lbl_diag_text = ttk.Label(info_frame, justify="left", font=("Consolas", 9))
+        self.lbl_diag_text.grid(row=0, column=0, sticky="w", padx=6, pady=6)
+
+        btns = ttk.Frame(tab)
+        btns.grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        ttk.Button(btns, text="Atualizar diagnóstico", command=self._refresh_diagnostics).grid(
+            row=0, column=0, padx=3
+        )
+        ttk.Button(btns, text="Copiar informações", command=self._copy_diagnostics).grid(row=0, column=1, padx=3)
+        ttk.Button(btns, text="Testar conexão com o GitHub", command=self._diag_test_connection).grid(
+            row=0, column=2, padx=3
+        )
+
+        self._refresh_diagnostics()
+
+    def _diagnostics_text(self):
+        return (
+            f"Versão: {APP_VERSION}\n"
+            f"Empacotado (.exe): {'sim' if getattr(sys, 'frozen', False) else 'não (rodando do código-fonte)'}\n"
+            f"Hook de mouse: {'ativo (WH_MOUSE_LL)' if self._using_raw_mouse_hook else 'fallback (pynput)'}\n"
+            f"Hook de teclado: {'ativo (WH_KEYBOARD_LL)' if self._using_raw_kb_hook else 'fallback (pynput)'}\n"
+            f"Clickers extras: {len(self.clickers)}\n"
+            f"Pasta de configuração: {_appdata_dir()}\n"
+            f"Porta de instância única: {_SINGLE_INSTANCE_PORT}\n"
+        )
+
+    def _refresh_diagnostics(self):
+        self.lbl_diag_text.config(text=self._diagnostics_text())
+
+    def _copy_diagnostics(self):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self._diagnostics_text())
+        messagebox.showinfo("Diagnóstico", "Informações copiadas para a área de transferência.")
+
+    def _diag_test_connection(self):
+        def _run():
+            try:
+                _fetch_latest_release()
+                ok = True
+            except Exception:
+                ok = False
+            msg = "Conexão com o GitHub OK." if ok else "Não foi possível conectar ao GitHub agora."
+            self.root.after(0, lambda: messagebox.showinfo("Diagnóstico", msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
     def _build_tab_interface(self, tab):
         frame = ttk.LabelFrame(tab, text="Comportamento da janela")
         frame.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
@@ -1239,19 +1831,37 @@ class AutoClickerApp:
         self.var_sound = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frame, text="Tocar um som ao iniciar/parar o autoclique", variable=self.var_sound,
-        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        self.lbl_sound_path = ttk.Label(frame, text="Som: padrão (beep)")
+        self.lbl_sound_path.grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ttk.Button(frame, text="Escolher .wav...", command=self._pick_custom_sound).grid(
+            row=1, column=1, sticky="w", padx=6, pady=4
+        )
+        ttk.Button(frame, text="Restaurar padrão", command=self._reset_custom_sound).grid(
+            row=1, column=2, sticky="w", padx=6, pady=4
+        )
 
         self.var_always_on_top = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frame, text="Manter a janela sempre no topo", variable=self.var_always_on_top,
             command=lambda: self.root.attributes("-topmost", self.var_always_on_top.get()),
-        ).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4)
 
         self.var_minimize_on_start = tk.BooleanVar(value=False)
         ttk.Checkbutton(
             frame, text="Minimizar a janela automaticamente ao iniciar o autoclique",
             variable=self.var_minimize_on_start,
-        ).grid(row=2, column=0, sticky="w", padx=6, pady=4)
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        theme_frame = ttk.Frame(frame)
+        theme_frame.grid(row=4, column=0, columnspan=3, sticky="w", padx=6, pady=(8, 4))
+        ttk.Label(theme_frame, text="Tema:").grid(row=0, column=0, sticky="w")
+        self.var_theme = tk.StringVar(value="Claro")
+        ttk.Combobox(
+            theme_frame, textvariable=self.var_theme, width=10, state="readonly", values=["Claro", "Escuro"],
+        ).grid(row=0, column=1, padx=6, sticky="w")
+        self.var_theme.trace_add("write", lambda *_: self._apply_theme(self.var_theme.get()))
 
         startup_frame = ttk.LabelFrame(tab, text="Inicialização")
         startup_frame.grid(row=1, column=0, sticky="ew", padx=6, pady=6)
@@ -1279,6 +1889,43 @@ class AutoClickerApp:
     def _on_toggle_run_on_startup(self):
         _set_run_on_startup(self.var_run_on_startup.get())
 
+    def _pick_custom_sound(self):
+        path = filedialog.askopenfilename(title="Escolher som", filetypes=[("Arquivos WAV", "*.wav")])
+        if path:
+            self.custom_sound_path = path
+            self._refresh_sound_label()
+            self._schedule_autosave()
+
+    def _reset_custom_sound(self):
+        self.custom_sound_path = None
+        self._refresh_sound_label()
+        self._schedule_autosave()
+
+    def _refresh_sound_label(self):
+        if self.custom_sound_path:
+            self.lbl_sound_path.config(text=f"Som: {os.path.basename(self.custom_sound_path)}")
+        else:
+            self.lbl_sound_path.config(text="Som: padrão (beep)")
+
+    def _apply_theme(self, theme_name):
+        style = ttk.Style()
+        if theme_name == "Escuro":
+            bg, fg, field_bg = "#1e1e2e", "#e6e6e6", "#2a2a3c"
+            style.theme_use("clam")
+            style.configure(".", background=bg, foreground=fg, fieldbackground=field_bg)
+            for widget in ("TFrame", "TLabelframe", "TNotebook", "TCheckbutton", "TRadiobutton", "TLabel"):
+                style.configure(widget, background=bg, foreground=fg)
+            style.configure("TLabelframe.Label", background=bg, foreground=fg)
+            style.configure("TNotebook.Tab", background="#2a2a3c", foreground=fg)
+            style.map("TNotebook.Tab", background=[("selected", bg)])
+            style.configure("TButton", background="#33334a", foreground=fg)
+            style.configure("TEntry", fieldbackground=field_bg, foreground=fg)
+            style.configure("TCombobox", fieldbackground=field_bg, foreground=fg)
+            self.root.configure(bg=bg)
+        else:
+            style.theme_use(self._default_ttk_theme)
+            self.root.configure(bg="SystemButtonFace")
+
     def _build_tab_perfis(self, tab):
         info = ttk.Label(tab, text="Salve combinações de configurações para reutilizar depois.")
         info.grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 10))
@@ -1300,6 +1947,55 @@ class AutoClickerApp:
         self.combo_profiles.grid(row=0, column=0, padx=6, pady=6)
         ttk.Button(load_frame, text="Carregar", command=self._load_profile).grid(row=0, column=1, padx=4, pady=6)
         ttk.Button(load_frame, text="Excluir", command=self._delete_profile).grid(row=0, column=2, padx=4, pady=6)
+
+        share_frame = ttk.LabelFrame(tab, text="Compartilhar perfil")
+        share_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
+        ttk.Button(share_frame, text="Exportar selecionado...", command=self._export_profile).grid(
+            row=0, column=0, padx=6, pady=6
+        )
+        ttk.Button(share_frame, text="Importar de arquivo...", command=self._import_profile).grid(
+            row=0, column=1, padx=6, pady=6
+        )
+
+    def _export_profile(self):
+        name = self.var_selected_profile.get()
+        profiles = self._load_profiles()
+        if name not in profiles:
+            messagebox.showerror("Erro", "Selecione um perfil válido para exportar.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exportar perfil", defaultextension=".json",
+            initialfile=f"{name}.json", filetypes=[("Perfil ClickForge", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"clickforge_profile": name, "data": profiles[name]}, f, indent=2)
+            messagebox.showinfo("Perfis", f'Perfil "{name}" exportado.')
+        except OSError as e:
+            messagebox.showerror("Erro", f"Não foi possível salvar o arquivo: {e}")
+
+    def _import_profile(self):
+        path = filedialog.askopenfilename(title="Importar perfil", filetypes=[("Perfil ClickForge", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            messagebox.showerror("Erro", f"Não foi possível ler o arquivo: {e}")
+            return
+        suggested = payload.get("clickforge_profile", "Importado")
+        name = simpledialog.askstring("Importar perfil", "Nome para este perfil:", initialvalue=suggested)
+        if not name:
+            return
+        profiles = self._load_profiles()
+        profiles[name] = payload.get("data", payload)
+        self._save_profiles(profiles)
+        self._refresh_profile_list()
+        self.var_selected_profile.set(name)
+        messagebox.showinfo("Perfis", f'Perfil "{name}" importado.')
 
     # ---------- Captura de tecla ----------
 
@@ -1460,6 +2156,11 @@ class AutoClickerApp:
         """Chamado (já na thread principal, via root.after) para cada clique
         REAL do mouse detectado pelo hook — os sintéticos já foram filtrados
         antes de chegar aqui, então não há mais nada para "descontar"."""
+        if self.macro_recording:
+            self._record_macro_event({
+                "type": "mouse", "button": button.name, "pressed": pressed,
+                "pos": list(self.mouse_ctrl.position),
+            })
         trigger = ("mouse", button)
         if pressed and self._capture_trigger(trigger):
             return
@@ -1469,6 +2170,10 @@ class AutoClickerApp:
         """Chamado (já na thread principal, via root.after) para cada tecla
         REAL detectada pelo hook — os pressionamentos sintéticos (ação de
         teclado do autoclique) já vêm filtrados antes de chegar aqui."""
+        if self.macro_recording:
+            vk, scan = _key_to_vk_scan(key)
+            if vk is not None:
+                self._record_macro_event({"type": "key", "vk": vk, "scan": scan, "pressed": pressed})
         trigger = ("keyboard", key)
         if pressed and self._capture_trigger(trigger):
             return
@@ -1506,6 +2211,32 @@ class AutoClickerApp:
             return
         self.lbl_fixed_pos.config(text=f"capturando em {seconds_left}...")
         self.root.after(1000, lambda: self._countdown_capture(seconds_left - 1))
+
+    # ---------- Sequência de posições ----------
+
+    def _add_sequence_point(self):
+        pos = self.mouse_ctrl.position
+        self.sequence_positions.append(pos)
+        self._refresh_sequence_list()
+        self._schedule_autosave()
+
+    def _remove_sequence_point(self):
+        sel = self.list_sequence.curselection()
+        if not sel:
+            return
+        del self.sequence_positions[sel[0]]
+        self._refresh_sequence_list()
+        self._schedule_autosave()
+
+    def _clear_sequence_points(self):
+        self.sequence_positions = []
+        self._refresh_sequence_list()
+        self._schedule_autosave()
+
+    def _refresh_sequence_list(self):
+        self.list_sequence.delete(0, tk.END)
+        for i, (x, y) in enumerate(self.sequence_positions):
+            self.list_sequence.insert(tk.END, f"{i + 1}. x={x}, y={y}")
 
     # ---------- Indicador visual ----------
 
@@ -1600,6 +2331,9 @@ class AutoClickerApp:
         elif self.var_position_mode.get() == "Posição fixa" and not self.fixed_pos:
             messagebox.showerror("Erro", "Capture uma posição fixa antes de iniciar.")
             return
+        elif self.var_position_mode.get() == "Sequência de posições" and not self.sequence_positions:
+            messagebox.showerror("Erro", "Adicione ao menos uma posição na sequência antes de iniciar.")
+            return
 
         repeat_count = None
         duration_seconds = None
@@ -1638,6 +2372,7 @@ class AutoClickerApp:
 
         self.running = True
         self.click_count = 0
+        self._seq_index = 0
         self.stop_now_event.clear()
         self.lbl_status.config(text="Rodando", foreground="green")
         self.btn_toggle.config(text="Parar (ou pressione a tecla)")
@@ -1674,9 +2409,14 @@ class AutoClickerApp:
         if winsound is None:
             return
 
+        custom_path = self.custom_sound_path
+
         def _play():
             try:
-                winsound.Beep(freq, 120)
+                if custom_path and os.path.isfile(custom_path):
+                    winsound.PlaySound(custom_path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+                else:
+                    winsound.Beep(freq, 120)
             except Exception:
                 pass
 
@@ -1706,6 +2446,8 @@ class AutoClickerApp:
 
         use_fixed = action_kind == "mouse" and self.var_position_mode.get() == "Posição fixa"
         fixed_pos = self.fixed_pos
+        use_sequence = action_kind == "mouse" and self.var_position_mode.get() == "Sequência de posições"
+        sequence = list(self.sequence_positions)
         random_pos = self.var_random_pos.get()
         try:
             pos_radius = max(0, int(self.var_pos_radius.get() or 0))
@@ -1736,6 +2478,10 @@ class AutoClickerApp:
                 self.root.after(0, self.stop)
                 break
 
+            if self.var_pixel_trigger_enabled.get() and self.pixel_trigger_color and self.pixel_trigger_pos:
+                if not self._pixel_trigger_matches():
+                    continue
+
             if action_kind == "keyboard":
                 if action_vk is not None:
                     if hold_mode:
@@ -1747,7 +2493,13 @@ class AutoClickerApp:
                         _send_key(action_vk, action_scan, False)
             else:
                 original_pos = self.mouse_ctrl.position
-                target_pos = fixed_pos if use_fixed and fixed_pos else None
+                if use_sequence and sequence:
+                    target_pos = sequence[self._seq_index % len(sequence)]
+                    self._seq_index += 1
+                elif use_fixed and fixed_pos:
+                    target_pos = fixed_pos
+                else:
+                    target_pos = None
                 if target_pos and random_pos and pos_radius > 0:
                     angle = random.uniform(0, 2 * math.pi)
                     r = random.uniform(0, pos_radius)
@@ -1779,6 +2531,7 @@ class AutoClickerApp:
                 if return_pos and target_pos:
                     self.mouse_ctrl.position = original_pos
 
+            self._register_clicks(1)
             done += 1
             is_last = repeat_count is not None and done >= repeat_count
             now_ts = time.time()
@@ -1993,6 +2746,7 @@ class AutoClickerApp:
             "jitter_max": self.var_jitter_max.get(),
             "position_mode": self.var_position_mode.get(),
             "fixed_pos": list(self.fixed_pos) if self.fixed_pos else None,
+            "sequence_positions": [list(p) for p in self.sequence_positions],
             "random_pos": self.var_random_pos.get(),
             "pos_radius": self.var_pos_radius.get(),
             "show_marker": self.var_show_marker.get(),
@@ -2011,6 +2765,20 @@ class AutoClickerApp:
             "minimize_on_start": self.var_minimize_on_start.get(),
             "start_hidden": self.var_start_hidden.get(),
             "clickers": [c.to_dict() for c in self.clickers],
+            "macro_events": self.macro_events,
+            "macro_loop": self.var_macro_loop.get(),
+            "window_profile_enabled": self.var_window_profile_enabled.get(),
+            "window_profile_rules": self.window_profile_rules,
+            "schedule_enabled": self.var_schedule_enabled.get(),
+            "schedule_time": self.var_schedule_time.get(),
+            "idle_start_enabled": self.var_idle_start_enabled.get(),
+            "idle_start_minutes": self.var_idle_start_minutes.get(),
+            "pixel_trigger_enabled": self.var_pixel_trigger_enabled.get(),
+            "pixel_trigger_color": list(self.pixel_trigger_color) if self.pixel_trigger_color else None,
+            "pixel_trigger_pos": list(self.pixel_trigger_pos) if self.pixel_trigger_pos else None,
+            "pixel_tolerance": self.var_pixel_tolerance.get(),
+            "theme": self.var_theme.get(),
+            "custom_sound_path": self.custom_sound_path,
         }
 
     def _apply_config_dict(self, data):
@@ -2042,6 +2810,31 @@ class AutoClickerApp:
         g("always_on_top", self.var_always_on_top)
         g("minimize_on_start", self.var_minimize_on_start)
         g("start_hidden", self.var_start_hidden)
+        g("macro_loop", self.var_macro_loop)
+        g("window_profile_enabled", self.var_window_profile_enabled)
+        g("schedule_enabled", self.var_schedule_enabled)
+        g("schedule_time", self.var_schedule_time)
+        g("idle_start_enabled", self.var_idle_start_enabled)
+        g("idle_start_minutes", self.var_idle_start_minutes)
+        g("pixel_trigger_enabled", self.var_pixel_trigger_enabled)
+        g("pixel_tolerance", self.var_pixel_tolerance)
+        g("theme", self.var_theme)
+
+        self.macro_events = data.get("macro_events", [])
+        self._refresh_macro_status()
+
+        self.window_profile_rules = data.get("window_profile_rules", [])
+        self._refresh_window_rules()
+
+        pixel_color = data.get("pixel_trigger_color")
+        pixel_pos = data.get("pixel_trigger_pos")
+        self.pixel_trigger_color = tuple(pixel_color) if pixel_color and len(pixel_color) == 3 else None
+        self.pixel_trigger_pos = tuple(pixel_pos) if pixel_pos and len(pixel_pos) == 2 else None
+        self._refresh_pixel_swatch()
+
+        self.custom_sound_path = data.get("custom_sound_path")
+        self._refresh_sound_label()
+        self._apply_theme(self.var_theme.get())
 
         fixed_pos = data.get("fixed_pos")
         if fixed_pos and len(fixed_pos) == 2:
@@ -2050,6 +2843,9 @@ class AutoClickerApp:
         else:
             self.fixed_pos = None
             self.lbl_fixed_pos.config(text="não definida")
+
+        self.sequence_positions = [tuple(p) for p in data.get("sequence_positions", []) if len(p) == 2]
+        self._refresh_sequence_list()
 
         trigger = _deserialize_trigger(data.get("hotkey"))
         if trigger is not None:
@@ -2134,6 +2930,8 @@ class AutoClickerApp:
         self.combo_profiles["values"] = names
         if names and self.var_selected_profile.get() not in names:
             self.var_selected_profile.set(names[0])
+        if hasattr(self, "combo_window_rule_profile"):
+            self.combo_window_rule_profile["values"] = names
 
     def _save_profile(self):
         name = self.var_profile_name.get().strip()
@@ -2285,6 +3083,7 @@ class ClickerInstance:
                 else:
                     _synthetic_click(self.button, click_count)
 
+            self.app._register_clicks(1)
             done += 1
             is_last = repeat_count is not None and done >= repeat_count
             now_ts = time.time()

@@ -11,6 +11,13 @@ Um autoclicker leve para Windows, feito em Python/Tkinter — configurável, com
 - **Intervalo configurável** (h/min/s/ms) com variação aleatória opcional, posição fixa ou atual do mouse (com variação aleatória de posição e indicador visual na tela), repetição por número de cliques ou duração.
 - **Perfis** para salvar e recarregar combinações de configuração.
 - **Roda em segundo plano** — minimiza para a bandeja do sistema em vez de fechar; pode iniciar junto com o Windows e, opcionalmente, já abrir oculto.
+- **Sequência de posições**: clica em vários pontos da tela em ordem, em loop.
+- **Gravador de macros**: grave cliques e teclas com o tempo entre eles e reproduza (com loop opcional).
+- **Perfil automático por janela ativa**: troca de perfil sozinho conforme o programa em foco.
+- **Agendamento**: iniciar em um horário definido ou após o computador ficar ocioso.
+- **Gatilho por cor de pixel**: só clica quando a cor em um ponto da tela bate com a escolhida.
+- **Estatísticas** de cliques (total e últimos 7 dias), **tema claro/escuro**, **som personalizado**, **exportar/importar perfis** e aba de **diagnóstico**.
+- **Janela redimensionável** e configurações salvas automaticamente.
 - **Atualização automática**: verifica releases novas no GitHub e aplica sozinho na próxima vez que o app for fechado.
 
 ## Como usar
