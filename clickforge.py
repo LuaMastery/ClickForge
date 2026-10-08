@@ -27,7 +27,10 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.2.0"
+
+FIRST_CLICK_IMMEDIATE = "Imediato"
+FIRST_CLICK_WAIT = "Esperar intervalo"
 # owner/repo do GitHub usado pelo verificador de atualizações (releases).
 UPDATE_REPO = "LuaMastery/ClickForge"
 
@@ -959,6 +962,19 @@ class AutoClickerApp:
         self.var_jitter_max = tk.StringVar(value="50")
         ttk.Entry(jitter_frame, textvariable=self.var_jitter_max, width=8).grid(row=1, column=3, padx=4, pady=4)
 
+        first_frame = ttk.LabelFrame(tab, text="Primeiro clique")
+        first_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
+
+        self.var_first_click = tk.StringVar(value=FIRST_CLICK_IMMEDIATE)
+        ttk.Radiobutton(
+            first_frame, text="Clicar imediatamente ao iniciar", value=FIRST_CLICK_IMMEDIATE,
+            variable=self.var_first_click,
+        ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        ttk.Radiobutton(
+            first_frame, text="Esperar o intervalo antes do primeiro clique", value=FIRST_CLICK_WAIT,
+            variable=self.var_first_click,
+        ).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+
     def _build_tab_posicao(self, tab):
         pos_frame = ttk.LabelFrame(tab, text="Posição do clique")
         pos_frame.grid(row=0, column=0, sticky="ew", padx=6, pady=6)
@@ -1296,6 +1312,11 @@ class AutoClickerApp:
         ttk.Label(interval_frame, text="Intervalo (ms):").grid(row=0, column=0, sticky="w", padx=6, pady=4)
         var_interval_ms = tk.StringVar(value=str(clicker.interval_ms))
         ttk.Entry(interval_frame, textvariable=var_interval_ms, width=10).grid(row=0, column=1, sticky="w", padx=4, pady=4)
+        var_first_immediate = tk.BooleanVar(value=clicker.first_click_immediate)
+        ttk.Checkbutton(
+            interval_frame, text="Clicar imediatamente ao iniciar (sem esperar o primeiro intervalo)",
+            variable=var_first_immediate,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
         rep_frame = ttk.LabelFrame(frm, text="Quando parar")
         rep_frame.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
@@ -1371,6 +1392,7 @@ class AutoClickerApp:
             except ValueError:
                 clicker.interval_ms = 100
             clicker.repeat_mode = var_repeat_mode.get()
+            clicker.first_click_immediate = var_first_immediate.get()
             try:
                 clicker.repeat_count = max(1, int(var_repeat_count.get() or 10))
             except ValueError:
@@ -2468,12 +2490,16 @@ class AutoClickerApp:
         start_time = time.time()
         done = 0
         last_ui_update = 0.0
+        skip_wait = self.var_first_click.get() == FIRST_CLICK_IMMEDIATE
         while not self.stop_now_event.is_set():
-            wait_time = interval
-            if random_interval:
-                wait_time += random.uniform(jitter_min, jitter_max)
-            if self.stop_now_event.wait(wait_time):
-                break
+            if skip_wait:
+                skip_wait = False
+            else:
+                wait_time = interval
+                if random_interval:
+                    wait_time += random.uniform(jitter_min, jitter_max)
+                if self.stop_now_event.wait(wait_time):
+                    break
 
             if duration_seconds is not None and (time.time() - start_time) >= duration_seconds:
                 self.root.after(0, self.stop)
@@ -2768,6 +2794,7 @@ class AutoClickerApp:
             "repeat_count": self.var_repeat_count.get(),
             "dur_h": self.var_dur_h.get(), "dur_m": self.var_dur_m.get(), "dur_s": self.var_dur_s.get(),
             "start_delay": self.var_start_delay.get(),
+            "first_click": self.var_first_click.get(),
             "hotkey": _serialize_trigger(self.hotkey),
             "hotkey_mode": self.var_hotkey_mode.get(),
             "stop_key": _serialize_trigger(self.stop_key),
@@ -2816,6 +2843,7 @@ class AutoClickerApp:
         g("repeat_count", self.var_repeat_count)
         g("dur_h", self.var_dur_h); g("dur_m", self.var_dur_m); g("dur_s", self.var_dur_s)
         g("start_delay", self.var_start_delay)
+        g("first_click", self.var_first_click)
         g("hotkey_mode", self.var_hotkey_mode)
         g("hotkeys_enabled", self.var_hotkeys_enabled)
         g("sound", self.var_sound)
@@ -3003,6 +3031,7 @@ class ClickerInstance:
         self.repeat_count = 10
         self.duration_seconds = 10.0
         self.start_delay = 0.0
+        self.first_click_immediate = True
 
         self.trigger = None
         self.trigger_mode = "Alternar"
@@ -3071,8 +3100,11 @@ class ClickerInstance:
         start_time = time.time()
         done = 0
         last_ui_update = 0.0
+        skip_wait = self.first_click_immediate
         while not self.stop_now_event.is_set():
-            if self.stop_now_event.wait(interval):
+            if skip_wait:
+                skip_wait = False
+            elif self.stop_now_event.wait(interval):
                 break
             if duration_seconds is not None and (time.time() - start_time) >= duration_seconds:
                 self.app.root.after(0, self.stop)
@@ -3121,6 +3153,7 @@ class ClickerInstance:
             "repeat_count": self.repeat_count,
             "duration_seconds": self.duration_seconds,
             "start_delay": self.start_delay,
+            "first_click_immediate": self.first_click_immediate,
             "trigger": _serialize_trigger(self.trigger),
             "trigger_mode": self.trigger_mode,
             "hotkey_enabled": self.hotkey_enabled,
@@ -3142,6 +3175,7 @@ class ClickerInstance:
         self.repeat_count = data.get("repeat_count", 10)
         self.duration_seconds = data.get("duration_seconds", 10.0)
         self.start_delay = data.get("start_delay", 0.0)
+        self.first_click_immediate = data.get("first_click_immediate", True)
         self.trigger = _deserialize_trigger(data.get("trigger"))
         self.trigger_mode = data.get("trigger_mode", "Alternar")
         self.hotkey_enabled = data.get("hotkey_enabled", True)
