@@ -27,7 +27,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 FIRST_CLICK_IMMEDIATE = "Imediato"
 FIRST_CLICK_WAIT = "Esperar intervalo"
@@ -1582,30 +1582,73 @@ class AutoClickerApp:
         pixel_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=6)
 
         ttk.Label(
-            pixel_frame, text="Só clica quando a cor abaixo aparecer na posição capturada.",
+            pixel_frame, text="A cor abaixo é vigiada na posição capturada. Escolha o que fazer quando ela aparecer.",
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=(4, 0))
+
+        auto_frame = ttk.Frame(pixel_frame)
+        auto_frame.grid(row=1, column=0, columnspan=4, sticky="w", padx=6, pady=(4, 0))
+        self.var_pixel_autostart = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            auto_frame, text="Iniciar o autoclique automaticamente quando a cor aparecer",
+            variable=self.var_pixel_autostart,
+        ).grid(row=0, column=0, sticky="w")
+        self.var_pixel_autostop = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            auto_frame, text="Parar o autoclique quando a cor sumir", variable=self.var_pixel_autostop,
+        ).grid(row=1, column=0, sticky="w")
 
         self.var_pixel_trigger_enabled = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            pixel_frame, text="Ativar gatilho por cor", variable=self.var_pixel_trigger_enabled,
-        ).grid(row=1, column=0, sticky="w", padx=6, pady=4)
+            pixel_frame, text="Só clicar enquanto a cor estiver na tela", variable=self.var_pixel_trigger_enabled,
+        ).grid(row=2, column=0, sticky="w", padx=6, pady=4)
 
         self.lbl_pixel_swatch = tk.Label(pixel_frame, text="  ", bg="#808080", relief="sunken", width=4)
-        self.lbl_pixel_swatch.grid(row=1, column=1, padx=6, pady=4)
+        self.lbl_pixel_swatch.grid(row=2, column=1, padx=6, pady=4)
         self.lbl_pixel_info = ttk.Label(pixel_frame, text="nenhuma cor capturada")
-        self.lbl_pixel_info.grid(row=1, column=2, sticky="w", padx=6, pady=4)
+        self.lbl_pixel_info.grid(row=2, column=2, sticky="w", padx=6, pady=4)
 
-        ttk.Button(pixel_frame, text="Capturar cor na posição do mouse", command=self._capture_pixel_trigger).grid(
-            row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4
+        self.btn_pixel_capture = ttk.Button(
+            pixel_frame, text="Capturar cor da tela (3 s)", command=self._capture_pixel_trigger
         )
-        ttk.Label(pixel_frame, text="Tolerância:").grid(row=2, column=2, sticky="w", padx=6, pady=4)
+        self.btn_pixel_capture.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        ttk.Label(
+            pixel_frame, text="Clique e leve o mouse até o pixel desejado: a cor sob o mouse aparece ao vivo.",
+        ).grid(row=3, column=2, columnspan=2, sticky="w", padx=6, pady=4)
+
+        manual_frame = ttk.Frame(pixel_frame)
+        manual_frame.grid(row=4, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+        ttk.Label(manual_frame, text="Cor (hex):").grid(row=0, column=0, sticky="w")
+        self.var_pixel_hex = tk.StringVar(value="")
+        hex_entry = ttk.Entry(manual_frame, textvariable=self.var_pixel_hex, width=10)
+        hex_entry.grid(row=0, column=1, padx=(4, 8))
+        hex_entry.bind("<Return>", lambda e: self._apply_pixel_manual())
+        ttk.Button(manual_frame, text="Escolher...", command=self._choose_pixel_color).grid(row=0, column=2, padx=(0, 12))
+        ttk.Label(manual_frame, text="X:").grid(row=0, column=3)
+        self.var_pixel_x = tk.StringVar(value="")
+        ttk.Entry(manual_frame, textvariable=self.var_pixel_x, width=6).grid(row=0, column=4, padx=(2, 6))
+        ttk.Label(manual_frame, text="Y:").grid(row=0, column=5)
+        self.var_pixel_y = tk.StringVar(value="")
+        ttk.Entry(manual_frame, textvariable=self.var_pixel_y, width=6).grid(row=0, column=6, padx=(2, 8))
+        ttk.Button(manual_frame, text="Aplicar", command=self._apply_pixel_manual).grid(row=0, column=7)
+
+        ttk.Label(pixel_frame, text="Tolerância (0–255 por canal):").grid(row=5, column=0, sticky="w", padx=6, pady=4)
         self.var_pixel_tolerance = tk.StringVar(value="20")
         ttk.Entry(pixel_frame, textvariable=self.var_pixel_tolerance, width=6).grid(
-            row=2, column=3, padx=4, pady=4, sticky="w"
+            row=5, column=1, padx=4, pady=4, sticky="w"
         )
+        ttk.Button(pixel_frame, text="Testar agora", command=self._test_pixel_trigger).grid(
+            row=5, column=2, sticky="w", padx=6, pady=4
+        )
+        self.lbl_pixel_test = ttk.Label(pixel_frame, text="")
+        self.lbl_pixel_test.grid(row=6, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
+        self._pixel_capturing = False
 
         # Roda a cada 1s: agendamento, inatividade e troca de perfil por janela.
         self.root.after(1000, self._automation_tick)
+        # Vigia a cor de pixel (início/parada automáticos) a cada 100 ms.
+        self._pixel_was_matching = False
+        self._started_by_pixel = False
+        self.root.after(100, self._pixel_watch_tick)
 
     def _add_window_rule(self):
         match = self.var_window_rule_match.get().strip()
@@ -1634,15 +1677,97 @@ class AutoClickerApp:
         self.combo_window_rule_profile["values"] = names
 
     def _capture_pixel_trigger(self):
+        """Captura com contagem regressiva: ao clicar no botão o mouse está em
+        cima do próprio botão, então damos 3 s para levá-lo ao pixel desejado
+        e mostramos a cor sob o mouse ao vivo."""
+        if self._pixel_capturing:
+            return
+        self._pixel_capturing = True
+        self.btn_pixel_capture.state(["disabled"])
+        self._pixel_capture_deadline = time.monotonic() + 3.0
+        self._pixel_capture_tick()
+
+    def _pixel_capture_tick(self):
+        time_left = self._pixel_capture_deadline - time.monotonic()
         pos = self.mouse_ctrl.position
         color = _get_pixel_color(*pos)
-        if color is None:
-            messagebox.showerror("Erro", "Não foi possível ler a cor nessa posição.")
+        if time_left <= 0:
+            self._pixel_capturing = False
+            self.btn_pixel_capture.state(["!disabled"])
+            if color is None:
+                messagebox.showerror("Erro", "Não foi possível ler a cor nessa posição.")
+                self._refresh_pixel_swatch()
+                return
+            self.pixel_trigger_pos = pos
+            self.pixel_trigger_color = color
+            self._refresh_pixel_swatch()
+            self._schedule_autosave()
             return
-        self.pixel_trigger_pos = pos
+        if color is not None:
+            r, g, b = color
+            self.lbl_pixel_swatch.config(bg=f"#{r:02x}{g:02x}{b:02x}")
+            self.lbl_pixel_info.config(
+                text=f"capturando em {int(time_left) + 1}...  x={pos[0]}, y={pos[1]}  rgb({r},{g},{b})"
+            )
+        self.root.after(50, self._pixel_capture_tick)
+
+    @staticmethod
+    def _parse_hex_color(text):
+        text = text.strip().lstrip("#")
+        if len(text) == 3:
+            text = "".join(ch * 2 for ch in text)
+        if len(text) != 6:
+            return None
+        try:
+            return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return None
+
+    def _choose_pixel_color(self):
+        initial = "#%02x%02x%02x" % self.pixel_trigger_color if self.pixel_trigger_color else None
+        _rgb, hex_color = colorchooser.askcolor(color=initial, title="Cor que ativa o autoclique", parent=self.root)
+        if not hex_color:
+            return
+        self.var_pixel_hex.set(hex_color)
+        self._apply_pixel_manual()
+
+    def _apply_pixel_manual(self):
+        """Aplica a cor (hex) e a posição digitadas à mão."""
+        color = self._parse_hex_color(self.var_pixel_hex.get())
+        if color is None:
+            messagebox.showerror("Erro", "Cor inválida. Use o formato #RRGGBB, por exemplo #FF8800.")
+            return
+        pos = self.pixel_trigger_pos
+        x_text, y_text = self.var_pixel_x.get().strip(), self.var_pixel_y.get().strip()
+        if x_text or y_text:
+            try:
+                pos = (int(x_text), int(y_text))
+            except ValueError:
+                messagebox.showerror("Erro", "X e Y precisam ser números inteiros.")
+                return
+        if pos is None:
+            messagebox.showerror(
+                "Erro", "Informe também a posição (X e Y) onde essa cor deve aparecer, ou capture pela tela."
+            )
+            return
         self.pixel_trigger_color = color
+        self.pixel_trigger_pos = pos
         self._refresh_pixel_swatch()
         self._schedule_autosave()
+
+    def _test_pixel_trigger(self):
+        if not (self.pixel_trigger_color and self.pixel_trigger_pos):
+            self.lbl_pixel_test.config(text="Defina uma cor e uma posição primeiro.")
+            return
+        current = _get_pixel_color(*self.pixel_trigger_pos)
+        if current is None:
+            self.lbl_pixel_test.config(text="Não foi possível ler a cor nessa posição.")
+            return
+        ok = self._pixel_trigger_matches()
+        self.lbl_pixel_test.config(
+            text=f"Cor atual na posição: rgb({current[0]},{current[1]},{current[2]}) — "
+                 + ("COMBINA, o autoclique clicaria." if ok else "não combina, não clicaria.")
+        )
 
     def _refresh_pixel_swatch(self):
         if self.pixel_trigger_color:
@@ -1650,6 +1775,9 @@ class AutoClickerApp:
             self.lbl_pixel_swatch.config(bg=f"#{r:02x}{g:02x}{b:02x}")
             x, y = self.pixel_trigger_pos
             self.lbl_pixel_info.config(text=f"x={x}, y={y}  rgb({r},{g},{b})")
+            self.var_pixel_hex.set(f"#{r:02X}{g:02X}{b:02X}")
+            self.var_pixel_x.set(str(x))
+            self.var_pixel_y.set(str(y))
         else:
             self.lbl_pixel_swatch.config(bg="#808080")
             self.lbl_pixel_info.config(text="nenhuma cor capturada")
@@ -1663,6 +1791,26 @@ class AutoClickerApp:
         if current is None:
             return False
         return all(abs(a - b) <= tolerance for a, b in zip(current, self.pixel_trigger_color))
+
+    def _pixel_watch_tick(self):
+        try:
+            autostart = self.var_pixel_autostart.get()
+            autostop = self.var_pixel_autostop.get()
+            if (autostart or autostop) and self.pixel_trigger_color and self.pixel_trigger_pos:
+                matching = self._pixel_trigger_matches()
+                if matching and not self._pixel_was_matching and autostart and not self.running:
+                    self._started_by_pixel = True
+                    self.start()
+                elif not matching and autostop and self.running and self._started_by_pixel:
+                    self.stop()
+                if not self.running:
+                    self._started_by_pixel = False
+                self._pixel_was_matching = matching
+            else:
+                self._pixel_was_matching = False
+        except Exception:
+            pass
+        self.root.after(100, self._pixel_watch_tick)
 
     def _automation_tick(self):
         try:
@@ -2816,6 +2964,8 @@ class AutoClickerApp:
             "pixel_trigger_color": list(self.pixel_trigger_color) if self.pixel_trigger_color else None,
             "pixel_trigger_pos": list(self.pixel_trigger_pos) if self.pixel_trigger_pos else None,
             "pixel_tolerance": self.var_pixel_tolerance.get(),
+            "pixel_autostart": self.var_pixel_autostart.get(),
+            "pixel_autostop": self.var_pixel_autostop.get(),
             "theme": self.var_theme.get(),
             "custom_sound_path": self.custom_sound_path,
         }
@@ -2857,6 +3007,8 @@ class AutoClickerApp:
         g("idle_start_enabled", self.var_idle_start_enabled)
         g("idle_start_minutes", self.var_idle_start_minutes)
         g("pixel_trigger_enabled", self.var_pixel_trigger_enabled)
+        g("pixel_autostart", self.var_pixel_autostart)
+        g("pixel_autostop", self.var_pixel_autostop)
         g("pixel_tolerance", self.var_pixel_tolerance)
         g("theme", self.var_theme)
 
