@@ -27,7 +27,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.4.1"
 
 FIRST_CLICK_IMMEDIATE = "Imediato"
 FIRST_CLICK_WAIT = "Esperar intervalo"
@@ -55,7 +55,11 @@ CLICK_TYPE_COUNT = {"Simples": 1, "Duplo": 2, "Triplo": 3}
 GWL_EXSTYLE = -20
 WS_EX_LAYERED = 0x00080000
 WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_NOACTIVATE = 0x08000000
 LWA_COLORKEY = 0x00000001
+LWA_ALPHA = 0x00000002
+GA_ROOT = 2
 
 MARKER_TRANSPARENT_COLOR = "magenta"
 MARKER_COLORKEY = 0xFF00FF  # magenta em formato COLORREF (0x00BBGGRR)
@@ -217,6 +221,7 @@ _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 # Windows (veja o comentário grande lá em cima).
 INPUT_MOUSE = 0
 INPUT_KEYBOARD = 1
+MOUSEEVENTF_MOVE = 0x0001
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
 MOUSEEVENTF_RIGHTDOWN = 0x0008
@@ -278,10 +283,28 @@ def _send_mouse_button(button, down):
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
 
 
-def _synthetic_click(button, count=1):
+def _synthetic_click(button, count=1, press_delay=0.0):
     for _ in range(max(1, count)):
         _send_mouse_button(button, True)
+        if press_delay > 0:
+            time.sleep(press_delay)
         _send_mouse_button(button, False)
+
+
+def _nudge_mouse():
+    """Move o mouse 1 px e volta (movimento relativo real, marcado como do
+    app). Muitos programas e jogos só tratam um clique depois de verem o
+    ponteiro "se mexer" sobre o alvo; sem isso o clique parado é ignorado
+    até o usuário mexer o mouse."""
+    for dx in (1, -1):
+        inp = _INPUT()
+        inp.type = INPUT_MOUSE
+        inp.mi.dx = dx
+        inp.mi.dwFlags = MOUSEEVENTF_MOVE
+        inp.mi.dwExtraInfo = AUTOCLICK_INPUT_TAG
+        _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+        time.sleep(0.002)
+    time.sleep(0.004)
 
 
 def _key_to_vk_scan(key):
@@ -700,6 +723,9 @@ class AutoClickerApp:
 
         self.marker_window = None
         self.marker_canvas = None
+        self.seq_marker_windows = []
+        self.mark_banner = None
+        self._seq_adding = False
 
         # Autocliques extras, gerenciados pela aba "Múltiplos" — cada um roda
         # de forma totalmente independente do clicker principal acima.
@@ -814,31 +840,25 @@ class AutoClickerApp:
         notebook.grid(row=0, column=0, sticky="nsew")
         self.notebook = notebook
 
-        tab_clique = ttk.Frame(notebook, padding=8)
-        tab_intervalo = ttk.Frame(notebook, padding=8)
-        tab_posicao = ttk.Frame(notebook, padding=8)
-        tab_repeticao = ttk.Frame(notebook, padding=8)
-        tab_atalhos = ttk.Frame(notebook, padding=8)
-        tab_multi = ttk.Frame(notebook, padding=8)
-        tab_macro = ttk.Frame(notebook, padding=8)
-        tab_automacao = ttk.Frame(notebook, padding=8)
-        tab_estatisticas = ttk.Frame(notebook, padding=8)
-        tab_interface = ttk.Frame(notebook, padding=8)
-        tab_perfis = ttk.Frame(notebook, padding=8)
-        tab_diagnostico = ttk.Frame(notebook, padding=8)
+        # Cada aba é rolável: quando o conteúdo é maior que a janela, aparece
+        # uma barra de rolagem (e a roda do mouse funciona) em vez de cortar.
+        def make_tab(title):
+            outer, inner = self._scrollable_tab(notebook)
+            notebook.add(outer, text=title)
+            return inner
 
-        notebook.add(tab_clique, text="Clique")
-        notebook.add(tab_intervalo, text="Intervalo")
-        notebook.add(tab_posicao, text="Posição")
-        notebook.add(tab_repeticao, text="Repetição")
-        notebook.add(tab_atalhos, text="Atalhos")
-        notebook.add(tab_multi, text="Múltiplos")
-        notebook.add(tab_macro, text="Macro")
-        notebook.add(tab_automacao, text="Automação")
-        notebook.add(tab_estatisticas, text="Estatísticas")
-        notebook.add(tab_interface, text="Interface")
-        notebook.add(tab_perfis, text="Perfis")
-        notebook.add(tab_diagnostico, text="Diagnóstico")
+        tab_clique = make_tab("Clique")
+        tab_intervalo = make_tab("Intervalo")
+        tab_posicao = make_tab("Posição")
+        tab_repeticao = make_tab("Repetição")
+        tab_atalhos = make_tab("Atalhos")
+        tab_multi = make_tab("Múltiplos")
+        tab_macro = make_tab("Macro")
+        tab_automacao = make_tab("Automação")
+        tab_estatisticas = make_tab("Estatísticas")
+        tab_interface = make_tab("Interface")
+        tab_perfis = make_tab("Perfis")
+        tab_diagnostico = make_tab("Diagnóstico")
 
         self._build_tab_clique(tab_clique)
         self._build_tab_intervalo(tab_intervalo)
@@ -867,6 +887,48 @@ class AutoClickerApp:
         self.btn_toggle.grid(row=1, column=0, columnspan=2, sticky="ew", padx=6, pady=6)
         ctrl_frame.columnconfigure(0, weight=1)
         ctrl_frame.columnconfigure(1, weight=1)
+
+    def _scrollable_tab(self, notebook):
+        """Cria uma aba com rolagem vertical. Devolve (frame_externo,
+        frame_interno): o externo vai no notebook, o interno recebe o
+        conteúdo da aba."""
+        outer = ttk.Frame(notebook)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        inner = ttk.Frame(canvas, padding=8)
+        window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def relayout(_event=None):
+            canvas_w, canvas_h = canvas.winfo_width(), canvas.winfo_height()
+            needed_h = inner.winfo_reqheight()
+            # O conteúdo ocupa pelo menos a área visível (para linhas com
+            # "weight" continuarem esticando) e rola quando passa dela.
+            canvas.itemconfigure(window_id, width=canvas_w, height=max(needed_h, canvas_h))
+            canvas.configure(scrollregion=(0, 0, canvas_w, max(needed_h, canvas_h)))
+            if needed_h > canvas_h:
+                scrollbar.grid(row=0, column=1, sticky="ns")
+            else:
+                scrollbar.grid_remove()
+                canvas.yview_moveto(0)
+
+        inner.bind("<Configure>", relayout)
+        canvas.bind("<Configure>", relayout)
+
+        def on_wheel(event):
+            # Só a aba visível reage; listas, tabelas e textos rolam sozinhos.
+            if notebook.select() != str(outer):
+                return
+            if isinstance(event.widget, (tk.Listbox, tk.Text, ttk.Treeview)):
+                return
+            if inner.winfo_reqheight() > canvas.winfo_height():
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        canvas.bind_all("<MouseWheel>", on_wheel, add="+")
+        return outer, inner
 
     def _build_tab_clique(self, tab):
         action_frame = ttk.LabelFrame(tab, text="Tipo de ação")
@@ -1002,18 +1064,35 @@ class AutoClickerApp:
             value="Sequência de posições", variable=self.var_position_mode, command=self._refresh_marker,
         ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=(10, 4))
 
+        ttk.Label(
+            pos_frame,
+            text="Cada ponto aparece na tela com um marcador numerado (1, 2, 3...) — a ordem é a ordem dos cliques.",
+            wraplength=560,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 2))
+
         seq_row = ttk.Frame(pos_frame)
-        seq_row.grid(row=3, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
-        self.list_sequence = tk.Listbox(seq_row, height=4, width=26)
-        self.list_sequence.grid(row=0, column=0, rowspan=3, sticky="w")
-        ttk.Button(seq_row, text="Adicionar posição atual", command=self._add_sequence_point).grid(
-            row=0, column=1, padx=6, sticky="w"
+        seq_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=6, pady=(0, 6))
+        self.list_sequence = tk.Listbox(seq_row, height=7, width=28, exportselection=False)
+        self.list_sequence.grid(row=0, column=0, rowspan=6, sticky="nw")
+        self.list_sequence.bind("<<ListboxSelect>>", lambda e: self._refresh_sequence_markers())
+        ttk.Button(seq_row, text="Marcar pontos (F8 em cada ponto)", command=self._start_mark_sequence).grid(
+            row=0, column=1, columnspan=2, padx=6, sticky="ew"
+        )
+        self.btn_seq_add = ttk.Button(
+            seq_row, text="Adicionar posição do mouse (3 s)", command=self._add_sequence_point
+        )
+        self.btn_seq_add.grid(row=1, column=1, columnspan=2, padx=6, pady=2, sticky="ew")
+        ttk.Button(seq_row, text="Subir ▲", command=lambda: self._move_sequence_point(-1)).grid(
+            row=2, column=1, padx=6, sticky="ew"
+        )
+        ttk.Button(seq_row, text="Descer ▼", command=lambda: self._move_sequence_point(1)).grid(
+            row=2, column=2, sticky="ew"
         )
         ttk.Button(seq_row, text="Remover selecionada", command=self._remove_sequence_point).grid(
-            row=1, column=1, padx=6, sticky="w"
+            row=3, column=1, columnspan=2, padx=6, pady=2, sticky="ew"
         )
         ttk.Button(seq_row, text="Limpar tudo", command=self._clear_sequence_points).grid(
-            row=2, column=1, padx=6, sticky="w"
+            row=4, column=1, columnspan=2, padx=6, sticky="ew"
         )
 
         random_frame = ttk.LabelFrame(tab, text="Variação aleatória de posição")
@@ -1037,6 +1116,30 @@ class AutoClickerApp:
             variable=self.var_show_marker, command=self._refresh_marker,
         ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=4)
 
+        self.var_hide_markers_running = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            marker_frame, text="Esconder os marcadores enquanto o autoclique estiver rodando",
+            variable=self.var_hide_markers_running, command=self._refresh_marker,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+
+        self.var_marker_edit = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            marker_frame, text="Modo editar: arrastar os ícones para mudar a posição (desliga o 'atravessar clique')",
+            variable=self.var_marker_edit, command=self._refresh_marker,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+
+        ttk.Label(marker_frame, text="Visibilidade do ícone:").grid(row=4, column=0, sticky="w", padx=6, pady=4)
+        self.var_marker_opacity = tk.IntVar(value=100)
+        ttk.Scale(
+            marker_frame, from_=10, to=100, orient="horizontal", length=180,
+            variable=self.var_marker_opacity, command=lambda v: self._refresh_marker(),
+        ).grid(row=4, column=1, padx=4, pady=4, sticky="w")
+        self.lbl_marker_opacity = ttk.Label(marker_frame, text="100%")
+        self.lbl_marker_opacity.grid(row=4, column=2, sticky="w", padx=4)
+        self.var_marker_opacity.trace_add(
+            "write", lambda *_: self.lbl_marker_opacity.config(text=f"{self.var_marker_opacity.get()}%")
+        )
+
         self.var_marker_color = tk.StringVar(value="#facc15")
         ttk.Button(marker_frame, text="Cor do indicador...", command=self._pick_marker_color).grid(
             row=1, column=0, padx=6, pady=4, sticky="w"
@@ -1050,6 +1153,13 @@ class AutoClickerApp:
             misc_frame, text="Voltar o mouse à posição original depois de cada clique",
             variable=self.var_return_pos,
         ).grid(row=0, column=0, sticky="w", padx=6, pady=4)
+
+        self.var_nudge_mouse = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            misc_frame,
+            text="Mexer o mouse 1 px antes de cada clique (resolve programas que só aceitam o clique depois de um movimento)",
+            variable=self.var_nudge_mouse,
+        ).grid(row=1, column=0, sticky="w", padx=6, pady=4)
 
     def _build_tab_repeticao(self, tab):
         rep_frame = ttk.LabelFrame(tab, text="Quando parar")
@@ -1317,6 +1427,11 @@ class AutoClickerApp:
             interval_frame, text="Clicar imediatamente ao iniciar (sem esperar o primeiro intervalo)",
             variable=var_first_immediate,
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        var_nudge = tk.BooleanVar(value=clicker.nudge_mouse)
+        ttk.Checkbutton(
+            interval_frame, text="Mexer o mouse 1 px antes de cada clique (se o clique só funciona após mover o mouse)",
+            variable=var_nudge,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=6, pady=4)
 
         rep_frame = ttk.LabelFrame(frm, text="Quando parar")
         rep_frame.grid(row=row, column=0, columnspan=3, sticky="ew", **pad)
@@ -1393,6 +1508,7 @@ class AutoClickerApp:
                 clicker.interval_ms = 100
             clicker.repeat_mode = var_repeat_mode.get()
             clicker.first_click_immediate = var_first_immediate.get()
+            clicker.nudge_mouse = var_nudge.get()
             try:
                 clicker.repeat_count = max(1, int(var_repeat_count.get() or 10))
             except ValueError:
@@ -2216,6 +2332,12 @@ class AutoClickerApp:
         """Chamado (na thread principal, via root.after) a cada tecla ou
         clique do mouse fora do modo de captura. Roteia para o clicker
         principal e para cada clicker extra cujo gatilho bata."""
+        if self.mark_banner is not None:
+            # Durante a marcação de pontos nenhum atalho do autoclique age.
+            if pressed and trigger[0] == "keyboard":
+                self._mark_handle_key(trigger[1])
+            return
+
         if self.stop_key is not None and triggers_equal(trigger, self.stop_key):
             if pressed:
                 if self.running:
@@ -2386,17 +2508,30 @@ class AutoClickerApp:
     # ---------- Sequência de posições ----------
 
     def _add_sequence_point(self):
-        pos = self.mouse_ctrl.position
-        self.sequence_positions.append(pos)
-        self._refresh_sequence_list()
-        self._schedule_autosave()
+        """Adiciona a posição do mouse após 3 s — o tempo de levar o mouse
+        até o ponto desejado depois de clicar no botão."""
+        if self._seq_adding:
+            return
+        self._seq_adding = True
+        self._seq_add_countdown(3)
+
+    def _seq_add_countdown(self, seconds_left):
+        if seconds_left <= 0:
+            self._seq_adding = False
+            self.btn_seq_add.config(text="Adicionar posição do mouse (3 s)")
+            self.sequence_positions.append(tuple(self.mouse_ctrl.position))
+            self._refresh_sequence_list(select=len(self.sequence_positions) - 1)
+            self._schedule_autosave()
+            return
+        self.btn_seq_add.config(text=f"Adicionando em {seconds_left}...")
+        self.root.after(1000, lambda: self._seq_add_countdown(seconds_left - 1))
 
     def _remove_sequence_point(self):
         sel = self.list_sequence.curselection()
         if not sel:
             return
         del self.sequence_positions[sel[0]]
-        self._refresh_sequence_list()
+        self._refresh_sequence_list(select=min(sel[0], len(self.sequence_positions) - 1))
         self._schedule_autosave()
 
     def _clear_sequence_points(self):
@@ -2404,10 +2539,168 @@ class AutoClickerApp:
         self._refresh_sequence_list()
         self._schedule_autosave()
 
-    def _refresh_sequence_list(self):
+    def _move_sequence_point(self, delta):
+        sel = self.list_sequence.curselection()
+        if not sel:
+            return
+        i, j = sel[0], sel[0] + delta
+        if not 0 <= j < len(self.sequence_positions):
+            return
+        pts = self.sequence_positions
+        pts[i], pts[j] = pts[j], pts[i]
+        self._refresh_sequence_list(select=j)
+        self._schedule_autosave()
+
+    def _refresh_sequence_list(self, select=None):
         self.list_sequence.delete(0, tk.END)
         for i, (x, y) in enumerate(self.sequence_positions):
             self.list_sequence.insert(tk.END, f"{i + 1}. x={x}, y={y}")
+        if select is not None and 0 <= select < len(self.sequence_positions):
+            self.list_sequence.selection_set(select)
+            self.list_sequence.see(select)
+        self._refresh_sequence_markers()
+
+    def _draw_numbered_marker(self, canvas, cx, cy, number, color, selected=False, edit=False):
+        """Desenha o ícone de ponto: círculo + mira + selo numerado."""
+        r = 18
+        if edit:
+            # Disco sólido = área de "pegar" para arrastar o ponto.
+            canvas.create_oval(cx - r, cy - r, cx + r, cy + r, fill="#111827", outline="")
+        if selected:
+            canvas.create_oval(cx - r - 3, cy - r - 3, cx + r + 3, cy + r + 3, outline="#ffffff", width=3)
+        canvas.create_oval(cx - r, cy - r, cx + r, cy + r, outline=color, width=2)
+        gap = 5  # vão no centro: o pixel exato do clique fica livre
+        canvas.create_line(cx, cy - r - 4, cx, cy - gap, fill=color, width=1)
+        canvas.create_line(cx, cy + gap, cx, cy + r + 4, fill=color, width=1)
+        canvas.create_line(cx - r - 4, cy, cx - gap, cy, fill=color, width=1)
+        canvas.create_line(cx + gap, cy, cx + r + 4, cy, fill=color, width=1)
+        bx, by = cx + 16, cy - 16
+        canvas.create_oval(bx - 9, by - 9, bx + 9, by + 9, fill=color, outline="#000000")
+        canvas.create_text(bx, by, text=str(number), fill="#000000", font=("Segoe UI", 9, "bold"))
+
+    def _refresh_sequence_markers(self, hide=False):
+        """Mantém uma janelinha transparente e numerada na tela para cada
+        ponto da sequência, na mesma posição em que o clique vai acontecer."""
+        show = (
+            not hide
+            and not self._markers_suppressed()
+            and self.var_show_marker.get()
+            and self.var_position_mode.get() == "Sequência de posições"
+        )
+        points = list(self.sequence_positions) if show else []
+        while len(self.seq_marker_windows) > len(points):
+            win, _canvas = self.seq_marker_windows.pop()
+            win.destroy()
+        sel = self.list_sequence.curselection()
+        selected = sel[0] if sel else None
+        color = self.var_marker_color.get() or "#facc15"
+        size = 56
+        for i, (x, y) in enumerate(points):
+            if i >= len(self.seq_marker_windows):
+                win = tk.Toplevel(self.root)
+                win.overrideredirect(True)
+                win.attributes("-topmost", True)
+                win.configure(bg=MARKER_TRANSPARENT_COLOR)
+                try:
+                    win.attributes("-transparentcolor", MARKER_TRANSPARENT_COLOR)
+                except tk.TclError:
+                    pass
+                canvas = tk.Canvas(win, width=size, height=size, bg=MARKER_TRANSPARENT_COLOR, highlightthickness=0)
+                canvas.pack()
+                self._bind_marker_drag(canvas)
+                win.update_idletasks()
+                self.seq_marker_windows.append((win, canvas))
+            win, canvas = self.seq_marker_windows[i]
+            canvas.marker_idx = i
+            win.geometry(f"{size}x{size}+{x - size // 2}+{y - size // 2}")
+            canvas.delete("all")
+            edit = self.var_marker_edit.get()
+            canvas.config(cursor="fleur" if edit else "")
+            self._draw_numbered_marker(
+                canvas, size // 2, size // 2, i + 1, color, selected=(i == selected), edit=edit
+            )
+            self._style_marker(win)
+
+    def _start_mark_sequence(self):
+        """Modo de marcação: nada cobre a tela. Leve o mouse até cada ponto e
+        aperte F8 para marcá-lo (Backspace desfaz o último, Esc termina). Os
+        pontos já marcados aparecem na hora com seus ícones numerados."""
+        if self.mark_banner is not None:
+            return
+        if self.running:
+            self.stop()
+        self.var_position_mode.set("Sequência de posições")
+        self._refresh_marker()
+        self._refresh_sequence_markers()
+
+        banner = tk.Toplevel(self.root)
+        banner.overrideredirect(True)
+        banner.attributes("-topmost", True)
+        frame = tk.Frame(banner, bg="#111827", highlightbackground="#facc15", highlightthickness=2)
+        frame.pack()
+        self.lbl_mark_banner = tk.Label(
+            frame, bg="#111827", fg="#ffffff", font=("Segoe UI", 11, "bold"), padx=14, pady=6, justify="left",
+        )
+        self.lbl_mark_banner.pack(side="left")
+        tk.Button(
+            frame, text="Concluir", command=self._finish_mark_sequence, bg="#facc15", fg="#000000",
+            font=("Segoe UI", 10, "bold"), relief="flat", padx=12,
+        ).pack(side="left", padx=8, pady=6)
+        banner.update_idletasks()
+        try:
+            user32 = ctypes.windll.user32
+            hwnd = user32.GetAncestor(banner.winfo_id(), GA_ROOT) or banner.winfo_id()
+            style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            # Sem foco e fora do Alt+Tab: o jogo/programa por baixo continua ativo.
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        except Exception:
+            pass
+        self.mark_banner = banner
+        self._mark_tick()
+
+    def _mark_tick(self):
+        """Atualiza o aviso com a posição do mouse ao vivo."""
+        if self.mark_banner is None:
+            return
+        try:
+            x, y = self.mouse_ctrl.position
+            total = len(self.sequence_positions)
+            self.lbl_mark_banner.config(
+                text=f"Marcando o ponto {total + 1}   (mouse em x={x}, y={y})\n"
+                     f"F8 = marcar aqui   •   Backspace = desfazer   •   Esc = terminar   •   {total} marcado(s)"
+            )
+            bw = self.mark_banner.winfo_reqwidth()
+            screen_w = ctypes.windll.user32.GetSystemMetrics(0)
+            self.mark_banner.geometry(f"+{screen_w // 2 - bw // 2}+20")
+        except Exception:
+            pass
+        self.root.after(50, self._mark_tick)
+
+    def _mark_handle_key(self, key):
+        """Teclas do modo de marcação (chamado pelo roteador de gatilhos)."""
+        if key == keyboard.Key.f8:
+            self.sequence_positions.append(tuple(self.mouse_ctrl.position))
+            self._refresh_sequence_list(select=len(self.sequence_positions) - 1)
+            self._schedule_autosave()
+        elif key == keyboard.Key.backspace:
+            if self.sequence_positions:
+                self.sequence_positions.pop()
+                last = len(self.sequence_positions) - 1
+                self._refresh_sequence_list(select=last if last >= 0 else None)
+                self._schedule_autosave()
+        elif key == keyboard.Key.esc:
+            self._finish_mark_sequence()
+
+    def _finish_mark_sequence(self):
+        if self.mark_banner is None:
+            return
+        banner, self.mark_banner = self.mark_banner, None
+        try:
+            banner.destroy()
+        except tk.TclError:
+            pass
+        self._refresh_sequence_list(select=len(self.sequence_positions) - 1 if self.sequence_positions else None)
+        self._schedule_autosave()
 
     # ---------- Indicador visual ----------
 
@@ -2417,9 +2710,16 @@ class AutoClickerApp:
             self.var_marker_color.set(result[1])
             self._refresh_marker()
 
+    def _markers_suppressed(self):
+        """Marcadores ficam escondidos enquanto o autoclique roda (se a opção
+        estiver ligada) para nunca cobrirem o alvo do clique."""
+        return self.running and self.var_hide_markers_running.get()
+
     def _refresh_marker(self):
+        self._refresh_sequence_markers()
         show = (
-            self.var_show_marker.get()
+            not self._markers_suppressed()
+            and self.var_show_marker.get()
             and self.var_position_mode.get() == "Posição fixa"
             and self.fixed_pos is not None
         )
@@ -2446,33 +2746,90 @@ class AutoClickerApp:
                 pass
             canvas = tk.Canvas(win, width=size, height=size, bg=transparent, highlightthickness=0)
             canvas.pack()
+            self._bind_marker_drag(canvas)
             self.marker_window = win
             self.marker_canvas = canvas
             win.update_idletasks()
-            self._make_clickthrough(win)
 
         self.marker_window.geometry(f"{size}x{size}+{x - size // 2}+{y - size // 2}")
         canvas = self.marker_canvas
+        canvas.marker_idx = "fixed"
         canvas.delete("all")
+        c, gap = size // 2, 5
+        edit = self.var_marker_edit.get()
+        canvas.config(cursor="fleur" if edit else "")
+        if edit:
+            canvas.create_oval(4, 4, size - 4, size - 4, fill="#111827", outline="")
         canvas.create_oval(4, 4, size - 4, size - 4, outline=color, width=2)
-        canvas.create_line(size // 2, 0, size // 2, size, fill=color, width=1)
-        canvas.create_line(0, size // 2, size, size // 2, fill=color, width=1)
+        # Mira com um vão no centro: o pixel exato do clique fica livre
+        # (não cobre o alvo nem a cor lida pelo gatilho por cor).
+        canvas.create_line(c, 0, c, c - gap, fill=color, width=1)
+        canvas.create_line(c, c + gap, c, size, fill=color, width=1)
+        canvas.create_line(0, c, c - gap, c, fill=color, width=1)
+        canvas.create_line(c + gap, c, size, c, fill=color, width=1)
+        self._style_marker(self.marker_window)
 
-    @staticmethod
-    def _make_clickthrough(win):
-        # Faz o indicador ser puramente visual: os cliques do autoclique
-        # (e do usuário) atravessam a janela e chegam no que está atrás dela.
+    def _style_marker(self, win):
+        """Aplica à janela do marcador: transparência (opacidade escolhida),
+        sem foco e — fora do modo de edição — atravessável pelos cliques.
+        O estilo precisa ir na janela de nível superior (GA_ROOT): a que o
+        Tk expõe em winfo_id() é uma janela interna, e nela WS_EX_TRANSPARENT
+        não faz o clique atravessar."""
         try:
-            hwnd = win.winfo_id()
+            hwnd = ctypes.windll.user32.GetAncestor(win.winfo_id(), GA_ROOT) or win.winfo_id()
             user32 = ctypes.windll.user32
             style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+            # NOACTIVATE/TOOLWINDOW: o indicador nunca rouba o foco do jogo
+            # nem aparece na barra de tarefas / Alt+Tab.
+            style |= WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            if self.var_marker_edit.get():
+                style &= ~WS_EX_TRANSPARENT
+            else:
+                style |= WS_EX_TRANSPARENT
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
             # SetWindowLongW reseta a cor-chave configurada pelo Tk via
             # "-transparentcolor" (senão a janela vira um retângulo preto
             # sólido) — reaplica com SetLayeredWindowAttributes.
-            user32.SetLayeredWindowAttributes(hwnd, MARKER_COLORKEY, 0, LWA_COLORKEY)
+            try:
+                opacity = max(10, min(100, int(self.var_marker_opacity.get())))
+            except (ValueError, tk.TclError):
+                opacity = 100
+            user32.SetLayeredWindowAttributes(
+                hwnd, MARKER_COLORKEY, int(255 * opacity / 100), LWA_COLORKEY | LWA_ALPHA
+            )
         except Exception:
             pass
+
+    def _bind_marker_drag(self, canvas):
+        canvas.bind("<ButtonPress-1>", lambda e, c=canvas: self._marker_drag_start(e, c))
+        canvas.bind("<B1-Motion>", lambda e, c=canvas: self._marker_drag_move(e, c))
+        canvas.bind("<ButtonRelease-1>", lambda e, c=canvas: self._marker_drag_end(e, c))
+
+    def _marker_drag_start(self, event, canvas):
+        win = canvas.winfo_toplevel()
+        self._drag_offset = (event.x_root - win.winfo_x(), event.y_root - win.winfo_y())
+        idx = getattr(canvas, "marker_idx", None)
+        if isinstance(idx, int) and self.sequence_positions:
+            self.list_sequence.selection_clear(0, tk.END)
+            self.list_sequence.selection_set(idx)
+
+    def _marker_drag_move(self, event, canvas):
+        ox, oy = getattr(self, "_drag_offset", (0, 0))
+        canvas.winfo_toplevel().geometry(f"+{event.x_root - ox}+{event.y_root - oy}")
+
+    def _marker_drag_end(self, event, canvas):
+        win = canvas.winfo_toplevel()
+        half = win.winfo_width() // 2
+        pos = (win.winfo_x() + half, win.winfo_y() + half)
+        idx = getattr(canvas, "marker_idx", None)
+        if idx == "fixed":
+            self.fixed_pos = pos
+            self.lbl_fixed_pos.config(text=f"x={pos[0]}, y={pos[1]}")
+            self._refresh_marker()
+        elif isinstance(idx, int) and idx < len(self.sequence_positions):
+            self.sequence_positions[idx] = pos
+            self._refresh_sequence_list(select=idx)
+        self._schedule_autosave()
 
     # ---------- Início/parada ----------
 
@@ -2547,6 +2904,8 @@ class AutoClickerApp:
         self.stop_now_event.clear()
         self.lbl_status.config(text="Rodando", foreground="green")
         self.btn_toggle.config(text="Parar (ou pressione a tecla)")
+        self.var_marker_edit.set(False)
+        self._refresh_marker()
 
         # Acorda a thread de trabalho persistente para este ciclo (ver
         # comentário em __init__ sobre por que não criamos uma thread nova
@@ -2573,6 +2932,7 @@ class AutoClickerApp:
         self.stop_now_event.set()
         self.lbl_status.config(text="Parado", foreground="red")
         self.btn_toggle.config(text="Iniciar (ou pressione a tecla)")
+        self._refresh_marker()
         if self.var_sound.get():
             self._beep(440)
 
@@ -2633,6 +2993,10 @@ class AutoClickerApp:
             jitter_min = jitter_max = 0.0
 
         return_pos = self.var_return_pos.get()
+        nudge = action_kind == "mouse" and self.var_nudge_mouse.get()
+        # Pausa mínima entre apertar e soltar: alguns programas ignoram um
+        # clique "instantâneo". Só é usada quando o intervalo permite.
+        press_delay = 0.008 if interval >= 0.05 else 0.0
         action_vk, action_scan = _key_to_vk_scan(action_key) if action_kind == "keyboard" else (None, None)
 
         start_time = time.time()
@@ -2696,12 +3060,15 @@ class AutoClickerApp:
                         self.echo_button = button
                         self.pending_echo_count += expected_events
 
+                if nudge:
+                    _nudge_mouse()
+
                 if hold_mode:
                     _send_mouse_button(button, True)
                     time.sleep(hold_seconds)
                     _send_mouse_button(button, False)
                 else:
-                    _synthetic_click(button, click_count)
+                    _synthetic_click(button, click_count, press_delay)
 
                 if return_pos and target_pos:
                     self.mouse_ctrl.position = original_pos
@@ -2936,8 +3303,11 @@ class AutoClickerApp:
             "random_pos": self.var_random_pos.get(),
             "pos_radius": self.var_pos_radius.get(),
             "show_marker": self.var_show_marker.get(),
+            "marker_opacity": self.var_marker_opacity.get(),
+            "hide_markers_running": self.var_hide_markers_running.get(),
             "marker_color": self.var_marker_color.get(),
             "return_pos": self.var_return_pos.get(),
+            "nudge_mouse": self.var_nudge_mouse.get(),
             "repeat_mode": self.var_repeat_mode.get(),
             "repeat_count": self.var_repeat_count.get(),
             "dur_h": self.var_dur_h.get(), "dur_m": self.var_dur_m.get(), "dur_s": self.var_dur_s.get(),
@@ -2987,8 +3357,11 @@ class AutoClickerApp:
         g("random_pos", self.var_random_pos)
         g("pos_radius", self.var_pos_radius)
         g("show_marker", self.var_show_marker)
+        g("marker_opacity", self.var_marker_opacity)
+        g("hide_markers_running", self.var_hide_markers_running)
         g("marker_color", self.var_marker_color)
         g("return_pos", self.var_return_pos)
+        g("nudge_mouse", self.var_nudge_mouse)
         g("repeat_mode", self.var_repeat_mode)
         g("repeat_count", self.var_repeat_count)
         g("dur_h", self.var_dur_h); g("dur_m", self.var_dur_m); g("dur_s", self.var_dur_s)
@@ -3184,6 +3557,7 @@ class ClickerInstance:
         self.duration_seconds = 10.0
         self.start_delay = 0.0
         self.first_click_immediate = True
+        self.nudge_mouse = True
 
         self.trigger = None
         self.trigger_mode = "Alternar"
@@ -3272,12 +3646,14 @@ class ClickerInstance:
                         _send_key(action_vk, action_scan, True)
                         _send_key(action_vk, action_scan, False)
             else:
+                if self.nudge_mouse:
+                    _nudge_mouse()
                 if hold_mode:
                     _send_mouse_button(self.button, True)
                     time.sleep(hold_seconds)
                     _send_mouse_button(self.button, False)
                 else:
-                    _synthetic_click(self.button, click_count)
+                    _synthetic_click(self.button, click_count, 0.008 if interval >= 0.05 else 0.0)
 
             self.app._register_clicks(1)
             done += 1
@@ -3306,6 +3682,7 @@ class ClickerInstance:
             "duration_seconds": self.duration_seconds,
             "start_delay": self.start_delay,
             "first_click_immediate": self.first_click_immediate,
+            "nudge_mouse": self.nudge_mouse,
             "trigger": _serialize_trigger(self.trigger),
             "trigger_mode": self.trigger_mode,
             "hotkey_enabled": self.hotkey_enabled,
@@ -3328,6 +3705,7 @@ class ClickerInstance:
         self.duration_seconds = data.get("duration_seconds", 10.0)
         self.start_delay = data.get("start_delay", 0.0)
         self.first_click_immediate = data.get("first_click_immediate", True)
+        self.nudge_mouse = data.get("nudge_mouse", True)
         self.trigger = _deserialize_trigger(data.get("trigger"))
         self.trigger_mode = data.get("trigger_mode", "Alternar")
         self.hotkey_enabled = data.get("hotkey_enabled", True)
