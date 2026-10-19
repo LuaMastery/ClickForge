@@ -27,7 +27,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 
 FIRST_CLICK_IMMEDIATE = "Imediato"
 FIRST_CLICK_WAIT = "Esperar intervalo"
@@ -178,16 +178,28 @@ def _vk_event_to_key(vk, scan_code):
     special = _VK_TO_SPECIAL_KEY.get(vk)
     if special is not None:
         return special
+    if vk in _IGNORED_VKS:
+        return None
+    # Teclado numérico, mídia, navegador etc.: identificadas só pelo código.
+    if 0x60 <= vk <= 0x6F or 0xA6 <= vk <= 0xB9:
+        return keyboard.KeyCode.from_vk(vk)
+    # Letras, números e símbolos: o caractere BASE da tecla (sem Shift,
+    # CapsLock ou AltGr), para o atalho valer igual com ou sem modificadores.
+    # MapVirtualKeyW não altera o estado de teclas mortas (acentos), ao
+    # contrário do ToUnicode, que podia "comer" um acento já digitado.
     try:
-        state = (ctypes.c_byte * 256)()
-        ctypes.windll.user32.GetKeyboardState(ctypes.byref(state))
-        buf = ctypes.create_unicode_buffer(4)
-        n = ctypes.windll.user32.ToUnicode(vk, scan_code, state, buf, 4, 0)
-        if n > 0 and buf.value:
-            return keyboard.KeyCode.from_char(buf.value[0])
+        ch = ctypes.windll.user32.MapVirtualKeyW(vk, 2) & 0x7FFFFFFF  # MAPVK_VK_TO_CHAR
+        if ch >= 0x20:
+            return keyboard.KeyCode.from_char(chr(ch).lower())
     except Exception:
         pass
-    return None
+    # Qualquer outra tecla também vale: nunca descarta em silêncio.
+    return keyboard.KeyCode.from_vk(vk)
+
+
+# Códigos virtuais que não são teclas de verdade (botões do mouse, pacotes
+# Unicode do SendInput, "nenhuma tecla").
+_IGNORED_VKS = {0x00, 0x01, 0x02, 0x04, 0x05, 0x06, 0xE7, 0xFF}
 
 
 # Declara os tipos exatos dessas funções do Win32: sem isso, o ctypes assume
@@ -555,19 +567,27 @@ def _serialize_key(key):
         return {"type": "special", "name": key.name}
     if isinstance(key, keyboard.KeyCode) and key.char:
         return {"type": "char", "char": key.char}
+    if isinstance(key, keyboard.KeyCode) and key.vk is not None:
+        return {"type": "vk", "vk": int(key.vk)}
     return None
 
 
 def _deserialize_key(data):
     if not data:
         return None
+    if data.get("type") == "vk":
+        try:
+            return keyboard.KeyCode.from_vk(int(data["vk"]))
+        except (KeyError, TypeError, ValueError):
+            return None
     if data.get("type") == "special":
         try:
             return keyboard.Key[data["name"]]
         except KeyError:
             return None
     if data.get("type") == "char" and data.get("char"):
-        return keyboard.KeyCode.from_char(data["char"])
+        # Configs antigas podiam guardar a letra maiúscula (captura com Shift).
+        return keyboard.KeyCode.from_char(data["char"].lower())
     return None
 
 
@@ -592,7 +612,21 @@ def key_to_label(key):
         return SPECIAL_KEY_NAMES[key]
     if isinstance(key, keyboard.KeyCode) and key.char:
         return key.char.upper()
+    if isinstance(key, keyboard.KeyCode) and key.vk is not None:
+        return _vk_label(key.vk)
     return str(key).replace("Key.", "").upper()
+
+
+def _vk_label(vk):
+    if 0x60 <= vk <= 0x69:
+        return f"Num {vk - 0x60}"
+    named = {
+        0x6A: "Num *", 0x6B: "Num +", 0x6C: "Num Separador", 0x6D: "Num -", 0x6E: "Num .", 0x6F: "Num /",
+        0xA6: "Navegador: Voltar", 0xA7: "Navegador: Avançar", 0xA8: "Navegador: Atualizar",
+        0xAD: "Mudo", 0xAE: "Volume -", 0xAF: "Volume +", 0xB0: "Próxima faixa", 0xB1: "Faixa anterior",
+        0xB2: "Parar mídia", 0xB3: "Play/Pause",
+    }
+    return named.get(vk, f"Tecla (código 0x{vk:02X})")
 
 
 MOUSE_TRIGGER_LABELS = {
@@ -989,6 +1023,7 @@ class AutoClickerApp:
         self.btn_action_key.config(state="disabled" if is_mouse else "normal")
 
     def _start_action_key_capture(self):
+        self._release_button_focus()
         self.listening_for_action_key = True
         self.lbl_action_key.config(text="Pressione uma tecla...")
 
@@ -1389,6 +1424,7 @@ class AutoClickerApp:
 
         def _capture_action_key():
             var_action_key_label.set("Pressione uma tecla...")
+            win.focus_set()
             self._capture_callback = _on_action_key_captured
 
         btn_action_key = ttk.Button(action_frame, text="Definir tecla...", command=_capture_action_key)
@@ -1465,6 +1501,7 @@ class AutoClickerApp:
 
         def _capture_trigger_click():
             var_trigger_label.set("Pressione uma tecla ou clique com o mouse...")
+            win.focus_set()
             self._capture_callback = _on_trigger_captured
 
         ttk.Button(trigger_frame, text="Definir gatilho...", command=_capture_trigger_click).grid(
@@ -2286,11 +2323,23 @@ class AutoClickerApp:
 
     # ---------- Captura de tecla ----------
 
+    def _release_button_focus(self):
+        """Tira o foco do botão que iniciou a captura. Sem isso, apertar
+        Espaço ou Enter (as teclas que "clicam" o botão focado) reativa o
+        próprio botão em vez de ser capturado como atalho — parecia que o
+        app "recusava" essas teclas."""
+        try:
+            self.root.focus_set()
+        except tk.TclError:
+            pass
+
     def _start_hotkey_capture(self):
+        self._release_button_focus()
         self.listening_for_hotkey = True
         self.lbl_hotkey.config(text="Pressione uma tecla ou clique com o mouse...")
 
     def _start_stopkey_capture(self):
+        self._release_button_focus()
         self.listening_for_stopkey = True
         self.lbl_stop_key.config(text="Pressione uma tecla ou clique com o mouse...")
 
