@@ -27,7 +27,7 @@ except ImportError:
     winsound = None
 
 APP_NAME = "ClickForge"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 
 FIRST_CLICK_IMMEDIATE = "Imediato"
 FIRST_CLICK_WAIT = "Esperar intervalo"
@@ -243,6 +243,8 @@ MOUSEEVENTF_MIDDLEUP = 0x0040
 MOUSEEVENTF_XDOWN = 0x0080
 MOUSEEVENTF_XUP = 0x0100
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_SCANCODE = 0x0008
 
 
 class _MOUSEINPUT(ctypes.Structure):
@@ -324,6 +326,11 @@ def _key_to_vk_scan(key):
     (vk, scancode) que o SendInput precisa."""
     if key is None:
         return None, None
+    # Teclas especiais (Espaço, Enter, F1-F12, setas, Shift, Ctrl, Tab...) são
+    # membros do enum keyboard.Key; o código da tecla fica em .value. Sem isso
+    # elas não resolviam para nenhum vk e o autoclique NÃO enviava nada.
+    if isinstance(key, keyboard.Key):
+        key = key.value
     vk = getattr(key, "vk", None)
     if vk is None and isinstance(key, keyboard.KeyCode) and key.char:
         res = ctypes.windll.user32.VkKeyScanW(key.char)
@@ -335,14 +342,91 @@ def _key_to_vk_scan(key):
     return vk, scan
 
 
+# Teclas "estendidas" (setas, Insert/Delete/Home/End/PgUp/PgDn, Win, Ctrl/Alt
+# direitos, Num /): o scancode delas exige o flag EXTENDEDKEY.
+_EXTENDED_VKS = {
+    0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x2D, 0x2E,
+    0x5B, 0x5C, 0x5D, 0x6F, 0x90, 0xA3, 0xA5,
+}
+# Modo compatibilidade com jogos: manda a tecla pelo SCANCODE (como um teclado
+# físico). Jogos que leem DirectInput/Raw Input ignoram teclas enviadas só
+# pelo código virtual. É ligado/desligado pela interface.
+_KEY_SCANCODE_MODE = [True]
+
+
 def _send_key(vk, scan, down):
     inp = _INPUT()
     inp.type = INPUT_KEYBOARD
     inp.ki.wVk = vk
     inp.ki.wScan = scan
-    inp.ki.dwFlags = 0 if down else KEYEVENTF_KEYUP
+    flags = 0 if down else KEYEVENTF_KEYUP
+    if _KEY_SCANCODE_MODE[0] and scan:
+        flags |= KEYEVENTF_SCANCODE
+        if vk in _EXTENDED_VKS:
+            flags |= KEYEVENTF_EXTENDEDKEY
+    inp.ki.dwFlags = flags
     inp.ki.dwExtraInfo = AUTOCLICK_INPUT_TAG
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(_INPUT))
+
+
+def _is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _foreground_is_elevated():
+    """True se a janela em foco roda como administrador, False se não, None
+    se não deu para saber. O Windows (UIPI) bloqueia cliques e teclas de um
+    programa comum para uma janela elevada — por isso o autoclique "não
+    funciona" em alguns jogos/programas até o ClickForge também ser aberto
+    como administrador."""
+    try:
+        user32, kernel32, advapi32 = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.advapi32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if pid.value in (0, os.getpid()):
+            return None
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        hproc = kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not hproc:
+            return None
+        try:
+            token = wintypes.HANDLE()
+            if not advapi32.OpenProcessToken(wintypes.HANDLE(hproc), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+                return True if kernel32.GetLastError() == 5 else None  # acesso negado => nível mais alto
+            try:
+                elevation = wintypes.DWORD()
+                size = wintypes.DWORD()
+                ok = advapi32.GetTokenInformation(
+                    token, 20, ctypes.byref(elevation), ctypes.sizeof(elevation), ctypes.byref(size)  # TokenElevation
+                )
+                return bool(elevation.value) if ok else None
+            finally:
+                kernel32.CloseHandle(token)
+        finally:
+            kernel32.CloseHandle(wintypes.HANDLE(hproc))
+    except Exception:
+        return None
+
+
+def _wait_for_pid_exit(pid, timeout=15.0):
+    """Espera o processo `pid` terminar (usado ao reabrir como administrador:
+    a instância nova espera a antiga fechar para não bater na trava de
+    instância única)."""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            kernel32.WaitForSingleObject(wintypes.HANDLE(handle), int(timeout * 1000))
+            kernel32.CloseHandle(wintypes.HANDLE(handle))
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -1014,7 +1098,106 @@ class AutoClickerApp:
         ttk.Entry(press_frame, textvariable=self.var_hold_ms, width=8).grid(row=1, column=1, padx=4, pady=4)
         ttk.Label(press_frame, text="ms").grid(row=1, column=2, sticky="w")
 
+        compat_frame = ttk.LabelFrame(tab, text="Compatibilidade com jogos e programas")
+        compat_frame.grid(row=3, column=0, columnspan=4, sticky="ew", padx=6, pady=(6, 6))
+
+        self.var_game_compat = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            compat_frame,
+            text="Modo compatibilidade (teclas enviadas como teclado físico + clique com duração)",
+            variable=self.var_game_compat,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=6, pady=4)
+        self.var_game_compat.trace_add("write", lambda *_: self._apply_compat_mode())
+
+        ttk.Label(compat_frame, text="Duração do clique/tecla (ms):").grid(row=1, column=0, sticky="w", padx=6, pady=4)
+        self.var_click_press_ms = tk.StringVar(value="25")
+        ttk.Entry(compat_frame, textvariable=self.var_click_press_ms, width=8).grid(row=1, column=1, padx=4, pady=4, sticky="w")
+        ttk.Label(
+            compat_frame, text="(jogos leem a entrada a cada quadro; um clique curto demais passa batido)",
+        ).grid(row=1, column=2, sticky="w", padx=6)
+
+        self.lbl_admin_status = ttk.Label(compat_frame, text="")
+        self.lbl_admin_status.grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        self.btn_admin = ttk.Button(
+            compat_frame, text="Reiniciar como administrador...", command=self._restart_as_admin,
+        )
+        self.btn_admin.grid(row=2, column=2, sticky="w", padx=6, pady=4)
+        ttk.Label(
+            compat_frame,
+            text="Se o programa/jogo em foco roda como administrador, o Windows bloqueia o autoclique de um\n"
+                 "programa comum. Nesse caso, reinicie o ClickForge como administrador (você confirma no aviso do Windows).",
+            justify="left",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=6, pady=(0, 4))
+        self._refresh_admin_status()
+
         self._refresh_action_kind_state()
+
+    def _apply_compat_mode(self):
+        _KEY_SCANCODE_MODE[0] = bool(self.var_game_compat.get())
+
+    def _press_delay(self, interval):
+        """Pausa entre apertar e soltar. No modo compatibilidade usa a
+        duração escolhida (limitada à metade do intervalo, para altas
+        velocidades continuarem funcionando); fora dele, só 8 ms quando o
+        intervalo permite."""
+        if not self.var_game_compat.get():
+            return 0.008 if interval >= 0.05 else 0.0
+        try:
+            ms = max(0, int(float(self.var_click_press_ms.get() or 0)))
+        except (ValueError, tk.TclError):
+            ms = 0
+        return min(ms / 1000.0, interval / 2.0)
+
+    def _refresh_admin_status(self):
+        if _is_admin():
+            self.lbl_admin_status.config(text="Executando como administrador: sim")
+            self.btn_admin.state(["disabled"])
+        else:
+            self.lbl_admin_status.config(text="Executando como administrador: não")
+
+    def _restart_as_admin(self):
+        """Reabre o ClickForge com privilégios de administrador. Só acontece
+        quando o usuário pede aqui, e quem autoriza é o aviso do Windows
+        (UAC) — nada é alterado no sistema."""
+        if _is_admin():
+            return
+        if not messagebox.askyesno(
+            "Reiniciar como administrador",
+            "O ClickForge vai fechar e abrir de novo com privilégios de administrador. "
+            "O Windows vai pedir sua confirmação.\n\nContinuar?",
+        ):
+            return
+        if getattr(sys, "frozen", False):
+            params = f"--wait-pid={os.getpid()}"
+        else:
+            params = f'"{os.path.abspath(sys.argv[0])}" --wait-pid={os.getpid()}'
+        self._save_config()
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
+        if result <= 32:
+            messagebox.showinfo(
+                "Reiniciar como administrador", "O pedido foi cancelado. O ClickForge continua aberto como estava."
+            )
+            return
+        self._quit_app()
+
+    def _warn_if_foreground_elevated(self):
+        """Avisa (uma vez por minuto no máximo) quando o autoclique começa com
+        uma janela de administrador em foco e o ClickForge não é admin."""
+        if _is_admin():
+            return
+        now = time.time()
+        if now - getattr(self, "_last_elevation_warning", 0.0) < 60:
+            return
+        if _foreground_is_elevated() is True:
+            self._last_elevation_warning = now
+            try:
+                self.tray_icon.notify(
+                    "A janela em foco roda como administrador e o Windows bloqueia o autoclique. "
+                    "Na aba Clique, use \"Reiniciar como administrador\".",
+                    APP_NAME,
+                )
+            except Exception:
+                pass
 
     def _refresh_action_kind_state(self):
         is_mouse = self.var_action_kind.get() == "mouse"
@@ -2123,6 +2306,10 @@ class AutoClickerApp:
             f"Empacotado (.exe): {'sim' if getattr(sys, 'frozen', False) else 'não (rodando do código-fonte)'}\n"
             f"Hook de mouse: {'ativo (WH_MOUSE_LL)' if self._using_raw_mouse_hook else 'fallback (pynput)'}\n"
             f"Hook de teclado: {'ativo (WH_KEYBOARD_LL)' if self._using_raw_kb_hook else 'fallback (pynput)'}\n"
+            f"Administrador: {'sim' if _is_admin() else 'não'}\n"
+            f"Janela em foco como administrador: "
+            f"{ {True: 'sim (o Windows bloqueia o autoclique sem admin)', False: 'não', None: 'desconhecido'}[_foreground_is_elevated()] }\n"
+            f"Modo compatibilidade (scancode): {'ligado' if self.var_game_compat.get() else 'desligado'}\n"
             f"Clickers extras: {len(self.clickers)}\n"
             f"Pasta de configuração: {_appdata_dir()}\n"
             f"Porta de instância única: {_SINGLE_INSTANCE_PORT}\n"
@@ -2955,6 +3142,7 @@ class AutoClickerApp:
         self.btn_toggle.config(text="Parar (ou pressione a tecla)")
         self.var_marker_edit.set(False)
         self._refresh_marker()
+        self._warn_if_foreground_elevated()
 
         # Acorda a thread de trabalho persistente para este ciclo (ver
         # comentário em __init__ sobre por que não criamos uma thread nova
@@ -3045,7 +3233,7 @@ class AutoClickerApp:
         nudge = action_kind == "mouse" and self.var_nudge_mouse.get()
         # Pausa mínima entre apertar e soltar: alguns programas ignoram um
         # clique "instantâneo". Só é usada quando o intervalo permite.
-        press_delay = 0.008 if interval >= 0.05 else 0.0
+        press_delay = self._press_delay(interval)
         action_vk, action_scan = _key_to_vk_scan(action_key) if action_kind == "keyboard" else (None, None)
 
         start_time = time.time()
@@ -3078,6 +3266,8 @@ class AutoClickerApp:
                         _send_key(action_vk, action_scan, False)
                     else:
                         _send_key(action_vk, action_scan, True)
+                        if press_delay > 0:
+                            time.sleep(press_delay)
                         _send_key(action_vk, action_scan, False)
             else:
                 original_pos = self.mouse_ctrl.position
@@ -3357,6 +3547,8 @@ class AutoClickerApp:
             "marker_color": self.var_marker_color.get(),
             "return_pos": self.var_return_pos.get(),
             "nudge_mouse": self.var_nudge_mouse.get(),
+            "game_compat": self.var_game_compat.get(),
+            "click_press_ms": self.var_click_press_ms.get(),
             "repeat_mode": self.var_repeat_mode.get(),
             "repeat_count": self.var_repeat_count.get(),
             "dur_h": self.var_dur_h.get(), "dur_m": self.var_dur_m.get(), "dur_s": self.var_dur_s.get(),
@@ -3411,6 +3603,8 @@ class AutoClickerApp:
         g("marker_color", self.var_marker_color)
         g("return_pos", self.var_return_pos)
         g("nudge_mouse", self.var_nudge_mouse)
+        g("game_compat", self.var_game_compat)
+        g("click_press_ms", self.var_click_press_ms)
         g("repeat_mode", self.var_repeat_mode)
         g("repeat_count", self.var_repeat_count)
         g("dur_h", self.var_dur_h); g("dur_m", self.var_dur_m); g("dur_s", self.var_dur_s)
@@ -3671,6 +3865,7 @@ class ClickerInstance:
         hold_seconds = max(0, self.hold_ms) / 1000.0
         click_count = CLICK_TYPE_COUNT.get(self.click_type, 1) if self.action_kind == "mouse" else 1
         action_vk, action_scan = _key_to_vk_scan(self.action_key) if self.action_kind == "keyboard" else (None, None)
+        press_delay = self.app._press_delay(interval)
 
         start_time = time.time()
         done = 0
@@ -3693,6 +3888,8 @@ class ClickerInstance:
                         _send_key(action_vk, action_scan, False)
                     else:
                         _send_key(action_vk, action_scan, True)
+                        if press_delay > 0:
+                            time.sleep(press_delay)
                         _send_key(action_vk, action_scan, False)
             else:
                 if self.nudge_mouse:
@@ -3702,7 +3899,7 @@ class ClickerInstance:
                     time.sleep(hold_seconds)
                     _send_mouse_button(self.button, False)
                 else:
-                    _synthetic_click(self.button, click_count, 0.008 if interval >= 0.05 else 0.0)
+                    _synthetic_click(self.button, click_count, press_delay)
 
             self.app._register_clicks(1)
             done += 1
@@ -3761,6 +3958,13 @@ class ClickerInstance:
 
 
 def main():
+    # Reabertura como administrador: a instância nova espera a antiga fechar.
+    for arg in sys.argv[1:]:
+        if arg.startswith("--wait-pid="):
+            try:
+                _wait_for_pid_exit(int(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
     # Trava de instância única: evita duas janelas e dois hotkeys globais
     # brigando pelo mesmo toggle caso o .exe seja aberto duas vezes. A mesma
     # porta também serve para uma segunda tentativa avisar a instância que já
